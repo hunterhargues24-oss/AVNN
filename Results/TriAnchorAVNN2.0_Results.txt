@@ -1,0 +1,62 @@
+============================================================
+Iris  (150 samples, 4 features, 3 classes)
+============================================================
+  Accuracy    : 0.9467 ± 0.0340
+  Macro F1    : 0.9466 ± 0.0341
+  Weighted F1 : 0.9466 ± 0.0341
+
+  lam=0.700  k=5
+  Branch weights: direction=0.280 magnitude=0.240 euclidean=0.240 shape=0.240
+
+============================================================
+Wine (cultivar)  (178 samples, 13 features, 3 classes)
+============================================================
+  Accuracy    : 0.9830 ± 0.0228
+  Macro F1    : 0.9831 ± 0.0226
+  Weighted F1 : 0.9829 ± 0.0231
+
+  lam=0.700  k=5
+  Branch weights: direction=0.280 magnitude=0.240 euclidean=0.240 shape=0.240
+
+============================================================
+Breast Cancer  (569 samples, 30 features, 2 classes)
+============================================================
+  Accuracy    : 0.9543 ± 0.0179
+  Macro F1    : 0.9506 ± 0.0197
+  Weighted F1 : 0.9541 ± 0.0181
+
+  lam=0.700  k=5
+  Branch weights: direction=0.280 magnitude=0.240 euclidean=0.240 shape=0.240
+
+============================================================
+Red Wine Quality  (1599 samples, 11 features, 3 classes)
+============================================================
+  Accuracy    : 0.8537 ± 0.0177
+  Macro F1    : 0.5885 ± 0.0326
+  Weighted F1 : 0.8485 ± 0.0157
+
+  lam=0.700  k=5
+  Branch weights: direction=0.300 magnitude=0.220 euclidean=0.240 shape=0.240
+
+============================================================
+White Wine Quality  (4898 samples, 11 features, 3 classes)
+============================================================
+  Accuracy    : 0.8258 ± 0.0160
+  Macro F1    : 0.6351 ± 0.0274
+  Weighted F1 : 0.8216 ± 0.0149
+
+  lam=0.700  k=5
+  Branch weights: direction=0.300 magnitude=0.220 euclidean=0.240 shape=0.240
+  Subsampling training to 200000 (stratified)...
+
+============================================================
+ArrivalType (oil/gas)  (train (199999, 20), test (434163, 20), 4 classes)
+============================================================
+  Fit time    : 7.02s
+  Predict time: 7.35s
+  Accuracy    : 0.9649
+  Macro F1    : 0.5732
+  Weighted F1 : 0.9597
+
+  lam=0.700  k=10
+  Branch weights: direction=0.350 magnitude=0.300 euclidean=0.250 shape=0.100
