@@ -1,0 +1,65 @@
+============================================================
+Iris  (150 samples, 4 features, 3 classes)
+============================================================
+  Accuracy    : 0.9467 ± 0.0340
+  Macro F1    : 0.9466 ± 0.0341
+  Weighted F1 : 0.9466 ± 0.0341
+
+  lam=0.700  k=5  gravity=0.00
+  Branch weights: direction=0.280 magnitude=0.240 euclidean=0.240 shape=0.240
+
+============================================================
+Wine (cultivar)  (178 samples, 13 features, 3 classes)
+============================================================
+  Accuracy    : 0.9830 ± 0.0228
+  Macro F1    : 0.9831 ± 0.0226
+  Weighted F1 : 0.9829 ± 0.0231
+
+  lam=0.700  k=5  gravity=0.00
+  Branch weights: direction=0.280 magnitude=0.240 euclidean=0.240 shape=0.240
+
+============================================================
+Breast Cancer  (569 samples, 30 features, 2 classes)
+============================================================
+  Accuracy    : 0.9543 ± 0.0179
+  Macro F1    : 0.9506 ± 0.0197
+  Weighted F1 : 0.9541 ± 0.0181
+
+  lam=0.700  k=5  gravity=0.00
+  Branch weights: direction=0.280 magnitude=0.240 euclidean=0.240 shape=0.240
+
+============================================================
+Red Wine Quality  (1599 samples, 11 features, 3 classes)
+============================================================
+  Accuracy    : 0.8130 ± 0.0317
+  Macro F1    : 0.5967 ± 0.0318
+  Weighted F1 : 0.8281 ± 0.0252
+
+  lam=0.700  k=5  gravity=0.50
+  Branch weights: direction=0.300 magnitude=0.220 euclidean=0.240 shape=0.240
+  Gravity weights (cap=1.5): class0=1.59  class1=0.71  class2=0.71
+
+============================================================
+White Wine Quality  (4898 samples, 11 features, 3 classes)
+============================================================
+  Accuracy    : 0.8071 ± 0.0216
+  Macro F1    : 0.6390 ± 0.0218
+  Weighted F1 : 0.8122 ± 0.0191
+
+  lam=0.700  k=5  gravity=0.50
+  Branch weights: direction=0.300 magnitude=0.220 euclidean=0.240 shape=0.240
+  Gravity weights (cap=1.5): class0=1.59  class1=0.71  class2=0.71
+  Subsampling training to 200000 (stratified)...
+
+============================================================
+ArrivalType (oil/gas)  (train (199999, 20), test (434163, 20), 4 classes)
+============================================================
+  Fit time    : 6.83s
+  Predict time: 7.62s
+  Accuracy    : 0.9636
+  Macro F1    : 0.5794
+  Weighted F1 : 0.9592
+
+  lam=0.700  k=10  gravity=0.50
+  Branch weights: direction=0.350 magnitude=0.300 euclidean=0.250 shape=0.100
+  Gravity weights (cap=1.5): class1=1.38  class2=0.62  class3=1.38  class4=0.62
