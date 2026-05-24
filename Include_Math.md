@@ -1,3 +1,4 @@
+````markdown
 # Deep Technical Breakdown of AVNN Mathematics
 
 > Mathematical specification for the Angular Vector Nearest Neighbor (AVNN) family of models, including static, learnable, and FAISS-accelerated variants.
@@ -8,18 +9,18 @@
 
 The Angular Vector Nearest Neighbor (AVNN) framework is a geometric classification architecture built around:
 
-* Axis-separable angular geometry
-* Euclidean geometry in transformed angular space
-* Optional shape-invariant geometry
-* Centroid-based probabilistic inference (AVM branch)
-* Weighted k-nearest-neighbor voting (KNN branch)
+- Axis-separable angular geometry
+- Euclidean geometry in transformed angular space
+- Optional shape-invariant geometry
+- Centroid-based probabilistic inference (AVM branch)
+- Weighted k-nearest-neighbor voting (KNN branch)
 
 Unlike cosine similarity, AVNN treats each feature as an independent angular axis and measures per-feature angular deviation directly.
 
 The framework supports both:
 
-* **Static parameter-free models**
-* **Learnable differentiable models trained with backpropagation**
+- **Static parameter-free models**
+- **Learnable differentiable models trained with backpropagation**
 
 ---
 
@@ -27,64 +28,64 @@ The framework supports both:
 
 Let:
 
-[
-\mathbf{x} \in \mathbb{R}^{F}
-]
+```text
+x ∈ R^F
+````
 
-be a feature vector with (F) features.
+be a feature vector with `F` features.
 
 Normalization is computed using training-set statistics only.
 
 ---
 
-## 2.1 Standard Min-Max Scaling to ([0,1])
+## 2.1 Standard Min-Max Scaling to [0,1]
 
-[
-\hat{x}_i =
-\frac{x_i - \min_i}
-{\max_i - \min_i + \varepsilon}
-]
+```text
+x_hat_i =
+(x_i - min_i)
+/
+(max_i - min_i + eps)
+```
 
 where:
 
-* (\min_i) = minimum value of feature (i)
-* (\max_i) = maximum value of feature (i)
-* (\varepsilon = 10^{-10})
+* `min_i` = minimum value of feature `i`
+* `max_i` = maximum value of feature `i`
+* `eps = 1e-10`
 
 This produces:
 
-[
-\hat{x}_i \in [0,1]
-]
+```text
+x_hat_i ∈ [0,1]
+```
 
 ---
 
-## 2.2 Recommended Scaling to ([-1,1])
+## 2.2 Recommended Scaling to [-1,1]
 
 AVNN experimentally performs better using full semicircular angular space:
 
-[
-\tilde{x}_i = 2\hat{x}_i - 1
-]
+```text
+x_tilde_i = 2*x_hat_i - 1
+```
 
 giving:
 
-[
-\tilde{x}_i \in [-1,1]
-]
+```text
+x_tilde_i ∈ [-1,1]
+```
 
 This expands the angular domain:
 
-[
-\arccos(\tilde{x}_i)
-\in [0,\pi]
-]
+```text
+acos(x_tilde_i) ∈ [0, pi]
+```
 
 instead of:
 
-[
-[0,\pi/2]
-]
+```text
+[0, pi/2]
+```
 
 which empirically improves separability.
 
@@ -94,25 +95,25 @@ which empirically improves separability.
 
 The Euclidean branch operates on a bounded non-linear angular transform:
 
-[
-x_i' =
-\tanh\left(
-s \cdot \arccos(\tilde{x}_i)
-\right)
-]
+```text
+x'_i =
+tanh(
+s * acos(x_tilde_i)
+)
+```
 
 where:
 
-* (s) = scaling factor
+* `s` = scaling factor
 
 Recommended values:
 
-| Input Range | Angular Domain | Recommended (s) |
-| ----------- | -------------- | --------------- |
-| ([0,1])     | ([0,\pi/2])    | 1.6             |
-| ([-1,1])    | ([0,\pi])      | 0.8             |
+| Input Range | Angular Domain | Recommended s |
+| ----------- | -------------- | ------------- |
+| [0,1]       | [0, pi/2]      | 1.6           |
+| [-1,1]      | [0, pi]        | 0.8           |
 
-This scaling avoids saturation in the (\tanh) branch.
+This scaling avoids saturation in the `tanh` branch.
 
 ---
 
@@ -122,41 +123,37 @@ AVNN does **not** use standard cosine similarity.
 
 Instead, each feature independently contributes an angular displacement.
 
-For feature (i):
+For feature `i`:
 
-[
-\theta_i(\mathbf{p}) =
-\arccos(\tilde{p}_i)
-]
+```text
+theta_i(p) = acos(p_tilde_i)
+```
 
-For centroid (\mathbf{c}):
+For centroid `c`:
 
-[
-\theta_i(\mathbf{c}) =
-\arccos(\tilde{c}_i)
-]
+```text
+theta_i(c) = acos(c_tilde_i)
+```
 
 The angular distance is:
 
-[
-d_{\text{ang}}(\mathbf{p},\mathbf{c})
-=====================================
-
-\sum_{i=1}^{F}
-w_i
-\left|
-\theta_i(\mathbf{p})
---------------------
-
-\theta_i(\mathbf{c})
-\right|
-]
+```text
+d_ang(p,c)
+=
+sum_{i=1..F}
+w_i *
+abs(
+theta_i(p)
+-
+theta_i(c)
+)
+```
 
 where:
 
-[
-w_i \ge 0
-]
+```text
+w_i >= 0
+```
 
 are per-feature weights.
 
@@ -166,20 +163,18 @@ are per-feature weights.
 
 In learnable variants:
 
-[
+```text
 w_i =
-F \cdot
-\frac{
-e^{a_i}
-}{
-\sum_j e^{a_j}
-}
-]
+F *
+exp(a_i)
+/
+sum_j exp(a_j)
+```
 
 where:
 
-* (a_i) are raw learnable logits
-* weights sum to (F)
+* `a_i` are raw learnable logits
+* weights sum to `F`
 
 This preserves the scale of a uniform average.
 
@@ -189,29 +184,22 @@ This preserves the scale of a uniform average.
 
 Euclidean distance is computed in transformed angular space:
 
-[
-d_{\text{euc}}(\mathbf{p},\mathbf{c})
-=====================================
-
-\left|
-\mathbf{p}'
------------
-
-\mathbf{c}'
-\right|_2
-]
+```text
+d_euc(p,c)
+=
+|| p' - c' ||_2
+```
 
 Expanded:
 
-[
-d_{\text{euc}}
-==============
-
-\sqrt{
-\sum_{i=1}^{F}
-(p_i' - c_i')^2
-}
-]
+```text
+d_euc
+=
+sqrt(
+sum_{i=1..F}
+(p'_i - c'_i)^2
+)
+```
 
 ---
 
@@ -221,54 +209,45 @@ The optional shape branch removes global scale and offset information.
 
 Define:
 
-[
-\mu_{\mathbf{p}}
-================
+```text
+mu_p
+=
+(1/F)
+*
+sum_{i=1..F}
+p_tilde_i
+```
 
-\frac{1}{F}
-\sum_{i=1}^{F}
-\tilde{p}_i
-]
-
-[
-\sigma_{\mathbf{p}}
-===================
-
-\sqrt{
-\frac{1}{F}
-\sum_{i=1}^{F}
-(\tilde{p}*i - \mu*{\mathbf{p}})^2
+```text
+sigma_p
+=
+sqrt(
+(1/F)
+*
+sum_{i=1..F}
+(p_tilde_i - mu_p)^2
 +
-\varepsilon
-}
-]
+eps
+)
+```
 
 Then:
 
-[
-z_i(\mathbf{p})
-===============
-
-\frac{
-\tilde{p}*i - \mu*{\mathbf{p}}
-}{
-\sigma_{\mathbf{p}}
-}
-]
+```text
+z_i(p)
+=
+(p_tilde_i - mu_p)
+/
+sigma_p
+```
 
 Shape distance:
 
-[
-d_{\text{shape}}(\mathbf{p},\mathbf{c})
-=======================================
-
-\left|
-\mathbf{z}(\mathbf{p})
-----------------------
-
-\mathbf{z}(\mathbf{c})
-\right|_2
-]
+```text
+d_shape(p,c)
+=
+|| z(p) - z(c) ||_2
+```
 
 This captures feature-pattern similarity independent of scale.
 
@@ -280,39 +259,35 @@ AVNN combines multiple geometric branches.
 
 For branch weights:
 
-[
-\beta_{\text{ang}},
-\beta_{\text{euc}},
-\beta_{\text{shape}}
-\ge 0
-]
+```text
+beta_ang,
+beta_euc,
+beta_shape >= 0
+```
 
 with:
 
-[
-\beta_{\text{ang}}
+```text
+beta_ang
 +
-\beta_{\text{euc}}
+beta_euc
 +
-\beta_{\text{shape}}
-= 1
-]
+beta_shape
+=
+1
+```
 
 the full blended distance becomes:
 
-[
-d(\mathbf{p},\mathbf{c})
-========================
-
-\beta_{\text{ang}}
-d_{\text{ang}}
+```text
+d(p,c)
+=
+beta_ang   * d_ang
 +
-\beta_{\text{euc}}
-d_{\text{euc}}
+beta_euc   * d_euc
 +
-\beta_{\text{shape}}
-d_{\text{shape}}
-]
+beta_shape * d_shape
+```
 
 ---
 
@@ -320,28 +295,26 @@ d_{\text{shape}}
 
 The original AVNN formulation uses:
 
-[
-\beta_{\text{shape}} = 0
-]
+```text
+beta_shape = 0
+```
 
 and:
 
-[
-\beta_{\text{ang}} = \alpha
-]
-
-[
-\beta_{\text{euc}} = 1-\alpha
-]
+```text
+beta_ang = alpha
+beta_euc = 1 - alpha
+```
 
 giving:
 
-[
-d =
-\alpha d_{\text{ang}}
+```text
+d
+=
+alpha * d_ang
 +
-(1-\alpha)d_{\text{euc}}
-]
+(1-alpha) * d_euc
+```
 
 ---
 
@@ -349,49 +322,46 @@ d =
 
 Each class centroid is computed from training data.
 
-For class (k):
+For class `k`:
 
-[
-\mathbf{c}_k
-============
-
-\frac{1}{N_k}
-\sum_{n:y_n=k}
-\mathbf{x}_n
-]
+```text
+c_k
+=
+(1/N_k)
+*
+sum_{n : y_n = k}
+x_n
+```
 
 Distances to centroids:
 
-[
-d_k = d(\mathbf{p},\mathbf{c}_k)
-]
+```text
+d_k = d(p, c_k)
+```
 
 Raw inverse-distance affinity:
 
-[
+```text
 r_k =
-\frac{1}{d_k + \varepsilon}
-]
+1 / (d_k + eps)
+```
 
 Temperature-scaled affinity:
 
-[
-\tilde{r}_k =
-\frac{1}{d_k/\tau + \varepsilon}
-]
+```text
+r_tilde_k =
+1 / (d_k / tau + eps)
+```
 
 Final AVM probability:
 
-[
-P_{\text{avm}}(k)
-=================
-
-\frac{
-\tilde{r}_k
-}{
-\sum_j \tilde{r}_j
-}
-]
+```text
+P_avm(k)
+=
+r_tilde_k
+/
+sum_j r_tilde_j
+```
 
 ---
 
@@ -401,40 +371,36 @@ AVNN uses hard k-nearest neighbors with inverse-distance weighting.
 
 Let:
 
-[
-\mathcal{N}_k(\mathbf{p})
-]
+```text
+N_k(p)
+```
 
-be the set of (k) nearest neighbors.
+be the set of `k` nearest neighbors.
 
 Neighbor weight:
 
-[
+```text
 w_i =
-\frac{1}{d_i + \varepsilon}
-]
+1 / (d_i + eps)
+```
 
 Normalized:
 
-[
-\hat{w}*i =
-\frac{
+```text
+w_hat_i =
 w_i
-}{
-\sum*{j \in \mathcal{N}_k} w_j
-}
-]
+/
+sum_{j ∈ N_k} w_j
+```
 
 Class probability:
 
-[
-P_{\text{knn}}(c)
-=================
-
-\sum_{i \in \mathcal{N}_k}
-\hat{w}_i
-\mathbf{1}[y_i=c]
-]
+```text
+P_knn(c)
+=
+sum_{i ∈ N_k}
+w_hat_i * 1[y_i = c]
+```
 
 ---
 
@@ -442,35 +408,33 @@ P_{\text{knn}}(c)
 
 The AVM and KNN branches are blended:
 
-[
-P_{\text{final}}(k)
-===================
-
-\lambda P_{\text{avm}}(k)
+```text
+P_final(k)
+=
+lambda * P_avm(k)
 +
-(1-\lambda)P_{\text{knn}}(k)
-]
+(1-lambda) * P_knn(k)
+```
 
 where:
 
-[
-\lambda \in [0,1]
-]
+```text
+lambda ∈ [0,1]
+```
 
 is learned via sigmoid:
 
-[
-\lambda = \sigma(a_\lambda)
-]
+```text
+lambda = sigmoid(a_lambda)
+```
 
 Prediction:
 
-[
-\hat{y}
-=======
-
-\arg\max_k P_{\text{final}}(k)
-]
+```text
+y_hat
+=
+argmax_k P_final(k)
+```
 
 ---
 
@@ -480,52 +444,45 @@ Learnable AVNN variants introduce geometric residual correction.
 
 The model predicts a soft centroid assignment:
 
-[
+```text
 p_k =
-\text{softmax}
-\left(
--\frac{d_k}{\tau}
-\right)
-]
+softmax(
+-d_k / tau
+)
+```
 
 Soft centroid target:
 
-[
-\mathbf{c}_{\text{soft}}
-========================
-
-\sum_k p_k \mathbf{c}_k
-]
+```text
+c_soft
+=
+sum_k p_k * c_k
+```
 
 Residual correction:
 
-[
-\Delta
-======
-
-g \beta
-\mathbf{s}
-\odot
-(\mathbf{c}_{\text{soft}} - \mathbf{x})
-]
+```text
+Delta
+=
+g * beta * s
+⊙
+(c_soft - x)
+```
 
 where:
 
-* (g = \sigma(a_g)) = residual gate
-* (\beta = e^{b}) = residual magnitude
-* (\mathbf{s} = \tanh(\mathbf{u})) = feature scaling vector
-* (\odot) = elementwise multiplication
+* `g = sigmoid(a_g)` = residual gate
+* `beta = exp(b)` = residual magnitude
+* `s = tanh(u)` = feature scaling vector
+* `⊙` = elementwise multiplication
 
 Corrected feature vector:
 
-[
-\mathbf{x}_{\text{corr}}
-========================
-
-\mathbf{x}
-+
-\Delta
-]
+```text
+x_corr
+=
+x + Delta
+```
 
 This replaces earlier teacher-forced centroid correction and removes train/inference mismatch.
 
@@ -535,9 +492,9 @@ This replaces earlier teacher-forced centroid correction and removes train/infer
 
 The corrected learnable AVNN uses:
 
-[
-\text{NLLLoss}
-]
+```text
+NLLLoss
+```
 
 on log-probabilities.
 
@@ -545,55 +502,52 @@ on log-probabilities.
 
 ## 12.1 Negative Log Likelihood
 
-[
-\mathcal{L}_{\text{NLL}}
-========================
-
--\log P(y)
-]
+```text
+L_NLL
+=
+-log P(y)
+```
 
 ---
 
 ## 12.2 Label Smoothing
 
-With smoothing parameter (\epsilon):
+With smoothing parameter `eps_ls`:
 
-[
-\mathcal{L}_{\text{smooth}}
-===========================
-
-(1-\epsilon)
-\mathcal{L}*{\text{NLL}}
+```text
+L_smooth
+=
+(1-eps_ls) * L_NLL
 +
-\frac{\epsilon}{K}
-\sum*{k=1}^{K}
--\log P(k)
-]
+(eps_ls / K)
+*
+sum_{k=1..K}
+-log P(k)
+```
 
 Recommended:
 
-[
-\epsilon = 0.05
-]
+```text
+eps_ls = 0.05
+```
 
 ---
 
 ## 12.3 Class Weighting
 
-For class (c):
+For class `c`:
 
-[
+```text
 v_c
-===
-
-\frac{N}{K \cdot n_c}
-]
+=
+N / (K * n_c)
+```
 
 where:
 
-* (N) = total samples
-* (K) = number of classes
-* (n_c) = samples in class (c)
+* `N` = total samples
+* `K` = number of classes
+* `n_c` = samples in class `c`
 
 Weights are capped and renormalized.
 
@@ -605,34 +559,44 @@ To accelerate neighbor retrieval, AVNN embeds all branches into a single vector.
 
 Define:
 
+```text
+v(p)
+=
 [
-\mathbf{v}(\mathbf{p})
-======================
-
-\left[
-\sqrt{\beta_{\text{ang}}},
-\boldsymbol{\theta}(\mathbf{p}),
-;
-\sqrt{\beta_{\text{euc}}},
-\mathbf{p}',
-;
-\sqrt{\beta_{\text{shape}}},
-\mathbf{z}(\mathbf{p})
-\right]
+sqrt(beta_ang)   * theta(p),
+sqrt(beta_euc)   * p',
+sqrt(beta_shape) * z(p)
 ]
+```
+
+where:
+
+```text
+theta(p)
+=
+[
+acos(p_tilde_1),
+acos(p_tilde_2),
+...
+acos(p_tilde_F)
+]
+```
 
 Then:
 
-[
-|
-\mathbf{v}(\mathbf{p})
-----------------------
+```text
+|| v(p) - v(c) ||_2^2
+```
 
-\mathbf{v}(\mathbf{c})
-|_2^2
-]
+approximates the blended AVNN distance:
 
-approximates the blended AVNN distance.
+```text
+beta_ang   * || theta(p)-theta(c) ||_2^2
++
+beta_euc   * || p'-c' ||_2^2
++
+beta_shape * || z(p)-z(c) ||_2^2
+```
 
 This is approximate because the angular branch uses weighted L1 geometry.
 
@@ -644,13 +608,13 @@ After FAISS retrieval, true AVNN distance is recomputed.
 
 The best-performing static configuration experimentally observed:
 
-| Parameter               | Value    |
-| ----------------------- | -------- |
-| Normalization           | ([-1,1]) |
-| Transform scale         | 0.8      |
-| Angular weight (\alpha) | 0.5      |
-| AVM/KNN blend (\lambda) | 0.7      |
-| Neighbors (k)           | 5        |
+| Parameter            | Value  |
+| -------------------- | ------ |
+| Normalization        | [-1,1] |
+| Transform scale      | 0.8    |
+| Angular weight alpha | 0.5    |
+| AVM/KNN blend lambda | 0.7    |
+| Neighbors k          | 5      |
 
 ---
 
@@ -662,23 +626,23 @@ The best-performing static configuration experimentally observed:
 
 Using:
 
-[
+```text
 [-1,1]
-]
+```
 
 instead of:
 
-[
+```text
 [0,1]
-]
+```
 
 expands angular coverage from:
 
-[
-[0,\pi/2]
-\rightarrow
-[0,\pi]
-]
+```text
+[0, pi/2]
+->
+[0, pi]
+```
 
 and improves baseline separability.
 
@@ -688,23 +652,23 @@ and improves baseline separability.
 
 Using:
 
-[
-\tanh(1.6 \cdot \arccos(x))
-]
+```text
+tanh(1.6 * acos(x))
+```
 
 on:
 
-[
+```text
 [-1,1]
-]
+```
 
 caused Euclidean branch saturation.
 
 Reducing scale to:
 
-[
+```text
 0.8
-]
+```
 
 restored useful Euclidean geometry.
 
@@ -714,9 +678,9 @@ restored useful Euclidean geometry.
 
 Ablation experiments showed:
 
-[
-\Delta \text{F1} \approx +0.036
-]
+```text
+Delta F1 ≈ +0.036
+```
 
 from the KNN branch.
 
@@ -726,9 +690,9 @@ from the KNN branch.
 
 Even when learned:
 
-[
-\alpha \approx 0.9
-]
+```text
+alpha ≈ 0.9
+```
 
 the Euclidean branch still improved stability and separation.
 
@@ -740,21 +704,21 @@ the Euclidean branch still improved stability and separation.
 
 Training:
 
-[
+```text
 O(NF)
-]
+```
 
 Prediction:
 
-[
+```text
 O(KF)
-]
+```
 
 Memory:
 
-[
+```text
 O(KF)
-]
+```
 
 ---
 
@@ -762,9 +726,9 @@ O(KF)
 
 Prediction:
 
-[
+```text
 O(NF)
-]
+```
 
 per query without indexing.
 
@@ -774,15 +738,15 @@ per query without indexing.
 
 Approximate search:
 
-[
-O(\log N \cdot F)
-]
+```text
+O(log N * F)
+```
 
 plus:
 
-[
+```text
 O(kF)
-]
+```
 
 for exact re-ranking.
 
@@ -790,19 +754,19 @@ for exact re-ranking.
 
 # 17. Core Formula Summary
 
-| Component          | Formula                                                            |                                           |   |
-| ------------------ | ------------------------------------------------------------------ | ----------------------------------------- | - |
-| Normalization      | (\tilde{x}_i = -1 + 2\frac{x_i-\min_i}{\max_i-\min_i})             |                                           |   |
-| Angle              | (\theta_i = \arccos(\tilde{x}_i))                                  |                                           |   |
-| Transform          | (x'_i = \tanh(0.8\theta_i))                                        |                                           |   |
-| Angular Distance   | (\sum_i w_i                                                        | \theta_i(\mathbf{p})-\theta_i(\mathbf{c}) | ) |
-| Euclidean Distance | (\sqrt{\sum_i (p'_i-c'_i)^2})                                      |                                           |   |
-| Shape Distance     | (|\mathbf{z}(\mathbf{p})-\mathbf{z}(\mathbf{c})|_2)                |                                           |   |
-| Blended Distance   | (\beta_a d_a + \beta_e d_e + \beta_s d_s)                          |                                           |   |
-| AVM Probability    | (\frac{1/(d_k/\tau+\varepsilon)}{\sum_j 1/(d_j/\tau+\varepsilon)}) |                                           |   |
-| KNN Probability    | Weighted inverse-distance vote                                     |                                           |   |
-| Final Probability  | (\lambda P_{avm} + (1-\lambda)P_{knn})                             |                                           |   |
-| Loss               | Label-smoothed weighted NLL                                        |                                           |   |
+| Component          | Formula                                            |   |           |   |     |
+| ------------------ | -------------------------------------------------- | - | --------- | - | --- |
+| Normalization      | `x_tilde_i = -1 + 2 * ((x_i-min_i)/(max_i-min_i))` |   |           |   |     |
+| Angle              | `theta_i = acos(x_tilde_i)`                        |   |           |   |     |
+| Transform          | `x'_i = tanh(0.8 * theta_i)`                       |   |           |   |     |
+| Angular Distance   | `sum_i w_i * abs(theta_i(p)-theta_i(c))`           |   |           |   |     |
+| Euclidean Distance | `sqrt(sum_i (p'_i-c'_i)^2)`                        |   |           |   |     |
+| Shape Distance     | `                                                  |   | z(p)-z(c) |   | _2` |
+| Blended Distance   | `beta_a*d_a + beta_e*d_e + beta_s*d_s`             |   |           |   |     |
+| AVM Probability    | `(1/(d_k/tau+eps)) / sum_j (1/(d_j/tau+eps))`      |   |           |   |     |
+| KNN Probability    | Weighted inverse-distance vote                     |   |           |   |     |
+| Final Probability  | `lambda*P_avm + (1-lambda)*P_knn`                  |   |           |   |     |
+| Loss               | Label-smoothed weighted NLL                        |   |           |   |     |
 
 ---
 
@@ -824,3 +788,6 @@ The framework combines:
 * and scalable neighbor retrieval
 
 into a unified classifier architecture.
+
+```
+```
