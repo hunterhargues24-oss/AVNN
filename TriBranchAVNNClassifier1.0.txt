@@ -1,0 +1,163 @@
+"""
+TriBranchAVNNClassifier
+=======================
+Static three‑branch classifier (angular, Euclidean, shape) – no training.
+
+Uses:
+  - Angular: axis‑separable mean absolute arccos difference per feature
+  - Euclidean: L2 on tanh_ac‑transformed features
+  - Shape: L2 between per‑sample z‑score normalised vectors
+
+Branch weights can be set manually (default equal). The final blended distance
+is used in both AVM centroid branch and KNN branch (hard k=5, inverse‑distance).
+"""
+
+import numpy as np
+from sklearn.base import BaseEstimator, ClassifierMixin
+
+
+class TriBranchAVNNClassifier(BaseEstimator, ClassifierMixin):
+    def __init__(self, alpha=0.5, lam=0.7, k=5, transform='tanh_ac',
+                 norm_range='[-1,1]', eps=1e-10,
+                 w_ang=0.333, w_euc=0.333, w_shape=0.334):
+        """
+        Parameters
+        ----------
+        alpha : float, default=0.5
+            Blend between angular and Euclidean inside each branch? Not used here.
+            Actually, we have separate branches, so alpha is not used.
+            Kept for API consistency.
+        lam : float, default=0.7
+            Blend between AVM centroid branch and KNN branch.
+        k : int, default=5
+            Number of nearest neighbors for KNN branch.
+        transform : str, default='tanh_ac'
+            Transform for Euclidean branch.
+        norm_range : str, default='[-1,1]'
+            Normalisation range for angular and shape branches.
+        eps : float, default=1e-10
+            Small constant for stability.
+        w_ang, w_euc, w_shape : float, sum to 1.
+            Branch weights for blending the three distances.
+        """
+        self.alpha = alpha          # not used, kept for API
+        self.lam = lam
+        self.k = k
+        self.transform = transform
+        self.norm_range = norm_range
+        self.eps = eps
+        self.w_ang = w_ang
+        self.w_euc = w_euc
+        self.w_shape = w_shape
+
+    # ---------- preprocessing ----------
+    def _norm_fit(self, X):
+        self.mn_ = X.min(axis=0)
+        self.rng_ = np.maximum(X.max(axis=0) - self.mn_, 1e-10)
+
+    def _norm_apply(self, X):
+        x = (X - self.mn_) / self.rng_
+        if self.norm_range == '[-1,1]':
+            x = -1.0 + 2.0 * x
+        return x
+
+    def _tanh_ac(self, x):
+        if self.norm_range == '[-1,1]':
+            x = np.clip(x, -1.0 + 1e-7, 1.0 - 1e-7)
+            return np.tanh(np.arccos(x) * 0.8)
+        else:
+            x = np.clip(x, 0.0, 1.0)
+            return np.tanh(np.arccos(x) * 1.6)
+
+    def _prepare(self, X):
+        X_norm = self._norm_apply(X)
+        X_trans = self._tanh_ac(X_norm)
+        return X_norm, X_trans
+
+    # ---------- distance components ----------
+    def _arccos_clip(self, x):
+        lo = -1.0 + self.eps if self.norm_range == '[-1,1]' else self.eps
+        return np.arccos(np.clip(x, lo, 1.0 - self.eps))
+
+    def _angular_dist_matrix(self, xn_a, xn_b):
+        th_a = self._arccos_clip(xn_a)
+        th_b = self._arccos_clip(xn_b)
+        ang = np.abs(th_a[:, None, :] - th_b[None, :, :]).mean(axis=2)
+        return ang
+
+    def _euclidean_dist_matrix(self, xt_a, xt_b):
+        diff = xt_a[:, None, :] - xt_b[None, :, :]
+        return np.sqrt((diff**2).sum(axis=2) + self.eps)
+
+    def _shape_dist_matrix(self, xn_a, xn_b):
+        # Z‑score per sample
+        mu_a = xn_a.mean(axis=1, keepdims=True)
+        sd_a = xn_a.std(axis=1, keepdims=True).clip(min=self.eps)
+        mu_b = xn_b.mean(axis=1, keepdims=True)
+        sd_b = xn_b.std(axis=1, keepdims=True).clip(min=self.eps)
+        za = (xn_a - mu_a) / sd_a
+        zb = (xn_b - mu_b) / sd_b
+        diff = za[:, None, :] - zb[None, :, :]
+        return np.sqrt((diff**2).sum(axis=2) + self.eps)
+
+    def _blended_dist_matrix(self, xn_a, xt_a, xn_b, xt_b):
+        d_ang = self._angular_dist_matrix(xn_a, xn_b)
+        d_euc = self._euclidean_dist_matrix(xt_a, xt_b)
+        d_shape = self._shape_dist_matrix(xn_a, xn_b)
+        return self.w_ang * d_ang + self.w_euc * d_euc + self.w_shape * d_shape
+
+    # ---------- fit ----------
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y)
+        self.classes_ = np.unique(y)
+        self.n_features_ = X.shape[1]
+
+        self._norm_fit(X)
+        X_norm, X_trans = self._prepare(X)
+
+        self.X_train_norm_ = X_norm
+        self.X_train_trans_ = X_trans
+        self.y_train_ = y
+
+        # Centroids in both spaces
+        self.centroids_norm_ = np.stack([X_norm[y == c].mean(0) for c in self.classes_])
+        self.centroids_trans_ = np.stack([X_trans[y == c].mean(0) for c in self.classes_])
+        return self
+
+    # ---------- branches ----------
+    def _avm_proba(self, X_norm, X_trans):
+        d = self._blended_dist_matrix(X_norm, X_trans,
+                                      self.centroids_norm_, self.centroids_trans_)
+        raw = 1.0 / (d + self.eps)
+        return raw / raw.sum(axis=1, keepdims=True)
+
+    def _knn_proba(self, X_norm, X_trans):
+        d = self._blended_dist_matrix(X_norm, X_trans,
+                                      self.X_train_norm_, self.X_train_trans_)
+        N = X_norm.shape[0]
+        K = len(self.classes_)
+        knn_proba = np.zeros((N, K))
+        for i in range(N):
+            idx = np.argpartition(d[i], self.k)[:self.k]
+            w = 1.0 / (d[i][idx] + self.eps)
+            w /= w.sum()
+            for j, weight in zip(idx, w):
+                class_idx = np.where(self.classes_ == self.y_train_[j])[0][0]
+                knn_proba[i, class_idx] += weight
+        return knn_proba
+
+    def predict_proba(self, X):
+        X = np.asarray(X, dtype=float)
+        X_norm, X_trans = self._prepare(X)
+        avm = self._avm_proba(X_norm, X_trans)
+        if self.lam < 1.0:
+            knn = self._knn_proba(X_norm, X_trans)
+            proba = self.lam * avm + (1 - self.lam) * knn
+        else:
+            proba = avm
+        return proba
+
+    def predict(self, X):
+        proba = self.predict_proba(X)
+        return self.classes_[np.argmax(proba, axis=1)]
