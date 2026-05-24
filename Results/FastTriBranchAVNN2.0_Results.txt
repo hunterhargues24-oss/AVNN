@@ -1,0 +1,62 @@
+============================================================
+Iris  (150 samples, 4 features, 3 classes)
+============================================================
+  Accuracy    : 0.9467 ± 0.0340
+  Macro F1    : 0.9465 ± 0.0341
+  Weighted F1 : 0.9465 ± 0.0341
+
+  lam=0.700  k=5
+  Branch weights: angular=0.340  euclidean=0.330  shape=0.330
+
+============================================================
+Wine (cultivar)  (178 samples, 13 features, 3 classes)
+============================================================
+  Accuracy    : 0.9887 ± 0.0138
+  Macro F1    : 0.9884 ± 0.0142
+  Weighted F1 : 0.9888 ± 0.0137
+
+  lam=0.700  k=5
+  Branch weights: angular=0.340  euclidean=0.330  shape=0.330
+
+============================================================
+Breast Cancer  (569 samples, 30 features, 2 classes)
+============================================================
+  Accuracy    : 0.9350 ± 0.0131
+  Macro F1    : 0.9305 ± 0.0140
+  Weighted F1 : 0.9350 ± 0.0131
+
+  lam=0.700  k=5
+  Branch weights: angular=0.340  euclidean=0.330  shape=0.330
+
+============================================================
+Red Wine Quality  (1599 samples, 11 features, 3 classes)
+============================================================
+  Accuracy    : 0.8499 ± 0.0146
+  Macro F1    : 0.5979 ± 0.0492
+  Weighted F1 : 0.8454 ± 0.0143
+
+  lam=0.700  k=5
+  Branch weights: angular=0.380  euclidean=0.280  shape=0.340
+
+============================================================
+White Wine Quality  (4898 samples, 11 features, 3 classes)
+============================================================
+  Accuracy    : 0.8242 ± 0.0143
+  Macro F1    : 0.6364 ± 0.0221
+  Weighted F1 : 0.8209 ± 0.0125
+
+  lam=0.700  k=5
+  Branch weights: angular=0.380  euclidean=0.280  shape=0.340
+  Subsampling training to 200000 (stratified)...
+
+============================================================
+ArrivalType (oil/gas)  (train (199999, 20), test (434163, 20), 4 classes)
+============================================================
+  Fit time    : 7.50s
+  Predict time: 5.82s
+  Accuracy    : 0.9649
+  Macro F1    : 0.5745
+  Weighted F1 : 0.9597
+
+  lam=0.700  k=10
+  Branch weights: angular=0.940  euclidean=0.030  shape=0.030
