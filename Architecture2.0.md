@@ -1,4 +1,4 @@
-# AutoLambdaAVNN — Architecture Reference v2.0
+# LearningAVNN — Architecture Reference v2.0
 
 > A geometric multi-prototype classifier that learns nonlinear angular manifolds over class structure and blends centroid reasoning with FAISS-accelerated neighbourhood inference.
 
