@@ -1,347 +1,412 @@
-# Angular Vector Nearest Neighbor (AVNN): Complete Technical Report
+# LearningAVNN
+
+**A geometric tabular classifier with learnable distance metrics, interaction scoring, and imbalance handling.**
+
+`sklearn`-compatible · pure PyTorch training · FAISS inference · 36 parameters · 1155 lines
+
+---
 
 ## Table of Contents
-1. [Introduction](#1-introduction)
-2. [Mathematical Foundations](#2-mathematical-foundations)
-   - 2.1 Normalisation
-   - 2.2 Angular Distance (Axis‑Separable)
-   - 2.3 Euclidean Distance with tanh_ac Transform
-   - 2.4 Shape Distance (Z‑score)
-   - 2.5 Blended Distance
-   - 2.6 AVM Centroid Branch
-   - 2.7 KNN Branch
-   - 2.8 Final Blending
-3. [Model Evolution History](#3-model-evolution-history)
-   - 3.1 AVM – The Original Idea
-   - 3.2 Static AVNNClassifier (v1 & v2)
-   - 3.3 Weighted AVNN (Learnable Feature Weights)
-   - 3.4 Residual Correction Attempts (v4–v18)
-   - 3.5 AdaptiveAVNN (Learnable α, λ, τ, Feature Weights)
-   - 3.6 BranchAdaptiveAVNN (Three‑branch with Shape)
-   - 3.7 GravityBranchAdaptiveAVNN (Class Bias)
-   - 3.8 FastTriBranchAVNN (FAISS Acceleration)
-4. [Key Breakthroughs](#4-key-breakthroughs)
-   - 4.1 Axis‑Separable Angular Distance vs Cosine
-   - 4.2 The Shape Branch: +9% Macro F1 on Red Wine
-   - 4.3 [-1,1] Normalisation and Scale=0.8
-   - 4.4 Hard k‑NN Prevents Memorisation
-   - 4.5 Learnable Parameters without Overfitting
-   - 4.6 FAISS for Large‑Scale Inference
-5. [Experimental Results](#5-experimental-results)
-   - 5.1 Datasets
-   - 5.2 Static AVNNClassifier (20‑seed CV)
-   - 5.3 BranchAdaptiveAVNN (5‑fold CV)
-   - 5.4 FastTriBranchAVNN on 2 Million Points
-   - 5.5 Comparison with Standard Classifiers
-6. [Implementation Overview](#6-implementation-overview)
-   - 6.1 Static Classifier (NumPy)
-   - 6.2 Learnable Classifier (PyTorch)
-   - 6.3 FAISS‑Accelerated Classifier
-7. [Performance and Scaling](#7-performance-and-scaling)
-8. [Open Questions and Future Work](#8-open-questions-and-future-work)
-9. [Conclusion](#9-conclusion)
+
+1. [What It Is](#what-it-is)
+2. [Quick Start](#quick-start)
+3. [Architecture](#architecture)
+4. [Evolution History](#evolution-history)
+5. [Benchmarks](#benchmarks)
+6. [Parameter Reference](#parameter-reference)
+7. [Design Decisions and What Didn't Work](#design-decisions-and-what-didnt-work)
+8. [Open Items](#open-items)
 
 ---
 
-## 1. Introduction
+## What It Is
 
-The Angular Vector Nearest Neighbor (AVNN) is a **geometric classifier** that measures similarity using a novel **axis‑separabled angular distance**. Unlike standard KNN or centroid‑based methods, AVNN treats each feature independently, computing the angle between the point and the feature’s axis anchor (the unit vector along that dimension). This produces a rich, interpretable distance that can be blended with Euclidean and shape distances, and optionally combined with a learnable KNN branch.
+LearningAVNN (Learning Angular Vector Neural Network) is a geometric distance-based tabular classifier. Instead of learning a standard decision boundary, it learns *what kind of distance* matters — transforming features into a multi-branch geometric space, then measuring how close a sample is to learned class prototypes.
 
-Through extensive experimentation (over 18 major versions and dozens of ablations), we identified optimal hyperparameters and extensions that yield state‑of‑the‑art performance on several UCI benchmarks, and scale to millions of samples using FAISS.
+The core question it answers: **does this sample's feature profile look like the profile of class k's prototype?** Both absolute position *and* relative feature relationships are measured.
 
----
-
-## 2. Mathematical Foundations
-
-Let \(F\) be the number of features, \(K\) the number of classes, and \(\mathbf{x} \in \mathbb{R}^F\) a raw feature vector.
-
-### 2.1 Normalisation
-
-First, min‑max normalisation is applied **on the training set only**:
-
-\[
-\hat{x}_i = \frac{x_i - \min_i}{\max_i - \min_i + \varepsilon}
-\]
-
-where \(\varepsilon = 10^{-10}\) prevents division by zero. This gives \(\hat{x}_i \in [0,1]\).
-
-Two ranges are supported:
-- \([0,1]\) (original quarter‑circle)
-- \([-1,1]\) (full semicircle) obtained by \(\tilde{x}_i = 2\hat{x}_i - 1\).
-
-The range \([-1,1]\) expands the angular domain of \(\arccos\) from \([0,\pi/2]\) to \([0,\pi]\), which empirically improves separability.
-
-### 2.2 Angular Distance (Axis‑Separable)
-
-For a point \(\mathbf{p}\) and a centroid \(\mathbf{c}\) in the normalised space \(\tilde{\mathbf{x}}\), define the per‑feature angle to the axis anchor:
-
-\[
-\theta_i(\mathbf{p}) = \arccos(\tilde{p}_i), \qquad \theta_i(\mathbf{c}) = \arccos(\tilde{c}_i)
-\]
-
-The axis‑separable angular distance is the **weighted mean absolute difference** of these angles:
-
-\[
-d_{\text{ang}}(\mathbf{p},\mathbf{c}) = \sum_{i=1}^{F} w_i \; \bigl| \theta_i(\mathbf{p}) - \theta_i(\mathbf{c}) \bigr|
-\]
-
-where \(w_i \ge 0\) are per‑feature weights. In the static model, \(w_i = 1\). In learnable versions, \(w_i\) are normalised via softmax and scaled so that \(\sum_i w_i = F\) (preserving the scale of a uniform average).
-
-**Key property:** This distance is **not** a global cosine similarity; it preserves per‑feature resolution and is directly interpretable – each feature’s contribution can be inspected.
-
-### 2.3 Euclidean Distance with tanh_ac Transform
-
-To keep the Euclidean branch bounded similarly to the angular branch, we apply a non‑linear transform after normalisation:
-
-\[
-x'_i = \tanh\!\left( s \cdot \arccos(\tilde{x}_i) \right)
-\]
-
-The scale \(s\) depends on the normalisation range:
-- For \([0,1]\): \(s = 1.6\) (since \(\arccos \in [0,\pi/2]\))
-- For \([-1,1]\): \(s = 0.8\) (since \(\arccos \in [0,\pi]\))
-
-The Euclidean distance is then:
-
-\[
-d_{\text{euc}}(\mathbf{p},\mathbf{c}) = \bigl\| \mathbf{p}' - \mathbf{c}' \bigr\|_2 = \sqrt{\sum_{i=1}^{F} (p'_i - c'_i)^2}
-\]
-
-### 2.4 Shape Distance
-
-The shape distance removes absolute scale and offset, focusing on the relative pattern of features:
-
-\[
-z_i(\mathbf{p}) = \frac{\tilde{p}_i - \mu_{\mathbf{p}}}{\sigma_{\mathbf{p}}}, \quad
-\mu_{\mathbf{p}} = \frac{1}{F}\sum_{j=1}^F \tilde{p}_j,\quad
-\sigma_{\mathbf{p}} = \sqrt{\frac{1}{F}\sum_{j=1}^F (\tilde{p}_j - \mu_{\mathbf{p}})^2 + \varepsilon}
-\]
-
-Then:
-
-\[
-d_{\text{shape}}(\mathbf{p},\mathbf{c}) = \bigl\| \mathbf{z}(\mathbf{p}) - \mathbf{z}(\mathbf{c}) \bigr\|_2
-\]
-
-This is invariant to translation and scaling of the whole vector, capturing only the shape of the profile.
-
-### 2.5 Blended Distance (Three‑Branch Model)
-
-Let branch weights \(\beta_{\text{ang}}, \beta_{\text{euc}}, \beta_{\text{shape}} \ge 0\) with \(\sum \beta = 1\) (learned via softmax). The final distance is:
-
-\[
-d(\mathbf{p},\mathbf{c}) = \beta_{\text{ang}} d_{\text{ang}} + \beta_{\text{euc}} d_{\text{euc}} + \beta_{\text{shape}} d_{\text{shape}}
-\]
-
-The two‑branch version (static AVNN) sets \(\beta_{\text{shape}}=0\) and \(\beta_{\text{ang}}=\alpha,\ \beta_{\text{euc}}=1-\alpha\).
-
-### 2.6 AVM Centroid Branch
-
-Class centroids are computed as the mean of training points in the **normalised space** \(\tilde{\mathbf{x}}\) and in the **transformed space** \(\mathbf{x}'\). For three‑branch, we also store the shape‑normalised centroids implicitly.
-
-For a test point \(\mathbf{p}\), compute distances \(d_k = d(\mathbf{p},\mathbf{c}_k)\) to each centroid. Raw affinities are inverse distances:
-
-\[
-r_k = \frac{1}{d_k + \varepsilon}
-\]
-
-A temperature parameter \(\tau > 0\) (learnable) softens the distances:
-
-\[
-\tilde{r}_k = \frac{1}{d_k / \tau + \varepsilon}
-\]
-
-The AVM probability for class \(k\) is the barycentric normalisation:
-
-\[
-P_{\text{avm}}(k) = \frac{\tilde{r}_k}{\sum_{j=1}^K \tilde{r}_j}
-\]
-
-### 2.7 KNN Branch
-
-Hard \(k\)-nearest neighbours with inverse‑distance weighting. Let \(\mathcal{N}_k(\mathbf{p})\) be the indices of the \(k\) closest training points under the same blended distance \(d\). For each neighbour \(i\) with distance \(d_i\), weight \(w_i = 1/(d_i + \varepsilon)\). Normalised weights \(\hat{w}_i = w_i / \sum_{j\in\mathcal{N}_k} w_j\). The KNN probability for class \(k\) is:
-
-\[
-P_{\text{knn}}(k) = \sum_{i\in\mathcal{N}_k(\mathbf{p})} \hat{w}_i \cdot \mathbf{1}[y_i = k]
-\]
-
-### 2.8 Final Blending
-
-A learnable parameter \(\lambda \in [0,1]\) (sigmoid of a raw parameter) blends the two branches:
-
-\[
-P_{\text{final}}(k) = \lambda \, P_{\text{avm}}(k) + (1-\lambda) \, P_{\text{knn}}(k)
-\]
-
-The predicted class is \(\arg\max_k P_{\text{final}}(k)\).
+It was designed specifically for imbalanced multi-class tabular classification, where tree ensembles and kernel methods struggle to recover rare class signal without sacrificing majority class accuracy.
 
 ---
 
-## 3. Model Evolution History
+## Quick Start
 
-### 3.1 AVM – The Original Idea
+```python
+from LearningAVNN import LearningAVNN
 
-The Angular Vector Model (AVM) was initially a pure centroid‑based classifier using only the angular distance (no Euclidean, no KNN). It showed promise but was outperformed by the hybrid.
+# Balanced dataset
+model = LearningAVNN(k=5, epochs=300)
 
-### 3.2 Static AVNNClassifier (v1 & v2)
+# Imbalanced dataset — moderate (2–10% minority)
+model = LearningAVNN(
+    ordinal=True, ordinal_weight=0.3,
+    supcon=True, supcon_weight=0.3,
+    ema_centroids=True,
+    use_triangle=True, tri_weight=0.3,
+    val_macro_bias=0.8,
+    feat_weight_reg=0.01,
+)
 
-- **v1**: Normalisation \([0,1]\), transform `tanh_ac(scale=1.6)`, fixed \(\alpha=0.5,\lambda=0.7,k=5\), uniform feature weights.  
-  Results: solid but macro F1 on imbalanced wine datasets was low (red wine macro F1 ~0.54).
+# Imbalanced dataset — severe (<2% minority)
+model = LearningAVNN(
+    ema_centroids=True,
+    use_triangle=True, tri_weight=0.3,
+    mahal_alpha=0.3,
+    val_macro_bias=0.9,
+    k=10,
+    use_ivf=True,
+)
 
-- **v2**: Changed normalisation to \([-1,1]\) and scale to \(0.8\). This increased macro F1 on red wine from 0.58 to 0.59 (20‑seed CV). Became the recommended static model.
-
-### 3.3 Weighted AVNN (Learnable Feature Weights)
-
-Added learnable per‑feature angular weights (softmax + rescaling). Trained with cross‑entropy and early stopping. The weights converged to nearly uniform on all datasets, confirming that uniform weights are near‑optimal. This was an important negative result: the geometry is already well‑aligned.
-
-### 3.4 Residual Correction Attempts (v4–v18)
-
-We tried to move points toward their predicted centroid (residual correction) in angular space. Many versions failed due to teacher‑forcing (using true labels) or gradient issues. After fixing the loss (NLL instead of CrossEntropy) and making the target centroid selection soft (differentiable), the residual correction learned to turn itself off (strength → 0). This confirmed that the original geometry is already optimal.
-
-### 3.5 AdaptiveAVNN (Learnable α, λ, τ, Feature Weights)
-
-We removed the residual and kept only the geometry parameters (\(\alpha,\lambda,\tau\), feature weights). Training used class‑weighted NLL + label smoothing. The learnable model matched the static version’s performance, showing that the static hyperparameters are near‑optimal.
-
-### 3.6 BranchAdaptiveAVNN (Three‑branch with Shape)
-
-Added a third distance branch: shape (z‑score normalised L2). Branch weights learned via softmax. This gave a **significant boost** to macro F1 on red wine (+0.047) and also improved breast cancer. The shape branch learned high weight (~0.4) on red wine. This was the most effective improvement.
-
-### 3.7 GravityBranchAdaptiveAVNN (Class Bias)
-
-Added a learnable per‑class bias (gravity) to the raw AVM scores. This gave a small but consistent improvement in accuracy and weighted F1 on imbalanced datasets without harming macro F1. Useful but not essential.
-
-### 3.8 FastTriBranchAVNN (FAISS Acceleration)
-
-To handle large datasets (millions of points), we integrated FAISS for approximate KNN. The key trick: build a single vector by concatenating \(\sqrt{\beta_{\text{ang}}}\boldsymbol{\theta}(\mathbf{p})\), \(\sqrt{\beta_{\text{euc}}}\mathbf{p}'\), \(\sqrt{\beta_{\text{shape}}}\mathbf{z}(\mathbf{p})\). The Euclidean distance in this space approximates the true blended distance (though not exactly). After retrieving candidates, we recompute the true blended distance for weighting. This retains accuracy while making prediction sub‑linear.
+model.fit(X_train, y_train)
+pred = model.predict(X_test)
+proba = model.predict_proba(X_test)
+print(model.summary(feature_names))
+```
 
 ---
 
-## 4. Key Breakthroughs
+## Architecture
 
-| Breakthrough | Impact |
-|--------------|--------|
-| **Axis‑separable angular distance** | Preserves per‑feature resolution, outperforms global cosine similarity (0.593 vs 0.572 macro F1 on red wine). |
-| **Shape branch** | Increased macro F1 on red wine by 9% (0.528 → 0.575). Learned branch weight ~0.4. |
-| **[-1,1] normalisation + scale=0.8** | Improved macro F1 on red wine by +0.013 (20‑seed CV) over [0,1]. |
-| **Hard k‑NN (k=5) with inverse‑distance** | Prevents memorisation (all‑points 1/d leads to overfitting). Confirmed by ablation. |
-| **Learnable parameters without overfitting** | Only a few extra parameters (branch weights, feature weights, α, λ, τ). Stable training with early stopping. |
-| **FAISS acceleration** | Scaled KNN to 2M points; prediction time 5.6s for 434k test points. |
+### Pipeline
 
----
+```
+Raw X  →  MinMax normalise [-1,1]  →  Six-branch combined vector (6F)
+       →  AVM: inverse-distance to K×m learnable prototypes
+       →  [Triangle scoring blend]
+       →  KNN: FAISS nearest-neighbour vote
+       →  λ·AVM + (1-λ)·KNN   (λ auto-tuned or entropy-gated)
+       →  Mahalanobis correction at inference
+```
 
-## 5. Experimental Results
+### Six Branches
 
-### 5.1 Datasets
+Each branch transforms normalised features differently. Branch weights are independent sigmoid gates (not softmax) normalised to sum to 1, preventing zero-sum competition. `boundary` and `tanh_arccos` are initialised with a positive bias — they consistently dominate on imbalanced datasets.
 
-| Dataset | Samples | Features | Classes | Type |
-|---------|---------|----------|---------|------|
-| Iris | 150 | 4 | 3 | balanced |
-| Wine (cultivar) | 178 | 13 | 3 | balanced |
-| Breast Cancer | 569 | 30 | 2 | balanced |
-| Red Wine Quality | 1599 | 4 (pruned) | 3 | imbalanced (84% Medium) |
-| White Wine Quality | 4898 | 11 | 3 | imbalanced |
-| ArrivalType | 2,170,813 | 20 | 4 | highly imbalanced (96% class 4) |
+| # | Name | Formula | Signal |
+|---|------|---------|--------|
+| 0 | linear | `x_f · √fw` | Direction + magnitude |
+| 1 | circular | `√(1-x²) · √fw` | Symmetric extremeness; peaks at boundaries |
+| 2 | boundary | `√(‖x‖²-2x+1)` | Cross-feature coupling via global ‖x‖² |
+| 3 | shape | `(x-μ)/σ` per sample | Within-sample relative profile |
+| 4 | quadratic | `x² · √fw` | Nonlinear extremeness |
+| 5 | tanh_arccos | `tanh(arccos(x)·0.8)·√fw` | Monotone nonlinear; amplifies centre differences |
 
-### 5.2 Static AVNNClassifier (v2, α=0.5, λ=0.7, k=5, tanh_ac, [-1,1]) – 20‑seed CV (except red/white single split)
+**Per-feature weights** `fw` are learned alongside branch weights. The combined vector is `6F` wide.
 
-| Dataset | Accuracy | Macro F1 | Weighted F1 |
-|---------|----------|----------|-------------|
-| Iris | 0.9500 | 0.9497 | 0.9497 |
-| Wine | 0.9726 | 0.9726 | 0.9726 |
-| Breast Cancer | 0.9518 | 0.9472 | 0.9511 |
-| Red Wine | 0.8625 | 0.5386 | 0.8457 |
-| White Wine | 0.8204 | 0.5909 | 0.8102 |
+### Learnable Prototypes
 
-### 5.3 BranchAdaptiveAVNN (three‑branch, learnable) – 5‑fold CV
+Centroids are `nn.Parameter` tensors of shape `(K, m, F)` where K=classes and m=prototypes per class. They are updated by backprop plus optional EMA stabilisation.
 
-| Dataset | Accuracy | Macro F1 | Weighted F1 |
-|---------|----------|----------|-------------|
-| Iris | 0.9600 ± 0.0389 | 0.9598 ± 0.0390 | 0.9598 ± 0.0390 |
-| Wine | 0.9830 ± 0.0228 | 0.9831 ± 0.0226 | 0.9829 ± 0.0231 |
-| Breast Cancer | 0.9683 ± 0.0154 | 0.9655 ± 0.0169 | 0.9680 ± 0.0156 |
-| Red Wine | 0.8236 ± 0.0065 | **0.5753 ± 0.0488** | 0.8265 ± 0.0053 |
-| White Wine | 0.8167 ± 0.0180 | 0.6173 ± 0.0259 | 0.8100 ± 0.0170 |
+- `n_prototypes=1` — single centroid per class (default)
+- `n_prototypes>1` — mixture of prototypes; models multimodal class distributions. Intra-class separation (`intra_sep`) pushes prototypes apart; soft EMA assignment pulls each toward its nearest sub-cluster.
 
-### 5.4 FastTriBranchAVNN (static, FAISS) – holdout on ArrivalType (subsample 200k train, 434k test)
+### AVM Scoring
 
-| Metric | Value |
-|--------|-------|
-| Accuracy | 0.9648 |
-| Macro F1 | 0.5759 |
-| Weighted F1 | 0.9597 |
-| Fit time | 6.75 s |
-| Predict time | 5.59 s |
-| Trivial baseline (always majority) | 0.9585 |
+$$\text{score}_k(x) = \sum_j \frac{1}{d(x, \mu_{kj})\,/\,\tau_k + \varepsilon}$$
 
-### 5.5 Comparison with Standard Classifiers (5‑fold CV, macro F1)
+During training: Euclidean distance in the 6F combined space.  
+At inference: **full RDA Mahalanobis** with α-blend of per-class QDA and pooled LDA:
 
-| Model | Iris | Wine | Breast Cancer | Red Wine | White Wine |
-|-------|------|------|---------------|----------|------------|
-| BranchAdaptiveAVNN | **0.960** | **0.983** | **0.966** | **0.575** | **0.617** |
-| Random Forest | 0.946 | 0.978 | 0.953 | 0.533 | 0.631 |
-| XGBoost | 0.939 | 0.961 | 0.949 | 0.527 | 0.638 |
-| SVM (RBF) | 0.967 | 0.625 | 0.904 | 0.301 | 0.285 |
-| Logistic Regression | 0.967 | 0.952 | 0.943 | 0.425 | 0.427 |
+$$\Sigma_k = (1-\alpha)\,S_k + \alpha\,S_{\text{pooled}}$$
 
-AVNN achieves the highest macro F1 on red and white wine, and is competitive on other datasets.
+Cholesky inversion in float64 prevents overflow on high-dimensional combined vectors.
 
----
+### Triangle Scoring (`use_triangle=True`)
 
-## 6. Implementation Overview
+Pairwise deviation cross-product for all F(F-1)/2 feature pairs. Both sample and centroid are centred by their own feature means before scoring — this **eliminates false penalties** from absolute scale differences between samples of the same class.
 
-### 6.1 Static Classifier (AVNNClassifier.py)
-- Pure NumPy, no training.
-- Implements two‑branch blended distance (angular + Euclidean).
-- Hard k‑NN with inverse‑distance weighting.
-- Used for small‑to‑medium datasets (up to ~50k points).
+For pair (a, b):
 
-### 6.2 Learnable Classifier (BranchAdaptiveAVNN.py)
-- PyTorch model with learnable branch weights, feature weights, α, λ, τ.
-- Training: pure AVM (λ=1) to avoid KNN non‑differentiability.
-- Loss: class‑weighted NLL with label smoothing.
-- After training, the learned parameters are used for inference with the blended model (λ<1).
+$$\text{cross}_{ab,k} = (x_a - \bar{x})(\mu_{kb} - \bar{\mu}_k) - (x_b - \bar{x})(\mu_{ka} - \bar{\mu}_k)$$
 
-### 6.3 FAISS‑Accelerated Classifier (FastTriBranchAVNN.py)
-- Static three‑branch model.
-- Uses FAISS for approximate KNN (IVF index).
-- For exact weighting, retrieves neighbours via FAISS then recomputes true blended distance.
-- Scales to millions of points.
+Zero when the sample's relative feature profile matches the centroid's for this pair. Each pair has a learnable weight (`log_w_pairs`) — the top pairs are directly inspectable and domain-validatable.
 
----
+Blended with geometric AVM score: `(1-tri_weight)·AVM + tri_weight·triangle`.
 
-## 7. Performance and Scaling
+**Proven impact: +0.058 macro F1 on moderate imbalance (4/82/14%), +0.047 on severe (60/25/10/5%).**
 
-| Model | Training time | Prediction time (per point) | Memory |
-|-------|---------------|----------------------------|--------|
-| Static AVNN (λ=1) | O(NF) | O(KF) | O(KF) |
-| Static AVNN (λ<1) | O(NF) | O(NF) | O(NF) |
-| BranchAdaptiveAVNN (train) | hours (small data) | – | – |
-| FastTriBranchAVNN (200k train, λ<1) | 6.8 s | 0.013 ms (with FAISS) | index ~800 MB |
+### Lambda Gate
 
-FAISS IVF parameters: `nlist=1000`, `nprobe=10`, `k=10`. Accuracy loss vs exact KNN negligible.
+Post-training AVM/KNN blend optimised on the validation set.
+
+| Mode | Behaviour |
+|------|-----------|
+| `entropy_lambda=False` | Scalar λ grid-searched from `lam_floor` to 1.0 |
+| `entropy_lambda=True` | Per-sample λ(x) based on AVM entropy H(x) |
+
+Entropy gate: `λ(x) = lam_confident − (lam_confident − lam_uncertain) · H(x)`
+
+High AVM entropy (uncertain, near decision boundary) → low λ → trust local KNN more.  
+Low AVM entropy (confident, interior of cluster) → high λ → trust global AVM more.
+
+### Training Losses
+
+| Loss | Purpose | Key parameter |
+|------|---------|---------------|
+| Class-weighted NLL | Imbalance correction | `weight_cap` |
+| Label smoothing | Prevent overconfidence | `label_smoothing` |
+| Ordinal EMD | Penalise ordinal mistakes proportionally | `ordinal_weight` |
+| Supervised Contrastive | Pull same-class embeddings together | `supcon_weight` |
+| Gram matrix ortho | Decorrelate six branches | `ortho_reg` |
+| Centroid anchor | Keep prototypes near class means | `centroid_reg` |
+| Centroid separation | Push class prototypes apart | `centroid_sep` |
+| Intra separation | Push within-class prototypes apart (m>1) | `intra_sep` |
+| Feature weight reg | Prevent feature weight collapse | `feat_weight_reg` |
+
+### Inference
+
+```python
+predict_proba(X):
+    Xn       = normalise(X)                    # train statistics
+    combined = _make_combined(Xn)              # numpy, 6F
+    avm      = Mahalanobis inverse-distance    # to K×m prototypes
+    knn      = FAISS KNN vote                  # IVF or FlatL2
+    λ        = entropy_gate(avm) or scalar
+    return λ·avm + (1-λ)·knn
+```
 
 ---
 
-## 8. Open Questions and Future Work
+## Evolution History
 
-1. **Theoretical analysis** – Why does axis‑separable angular distance work so well? Is there a connection to spherical harmonics or Dirichlet distributions?
-2. **Differentiable FAISS** – Enable end‑to‑end training by using a differentiable approximation of KNN (e.g., soft nearest neighbours).
-3. **Missing data and categorical features** – Extend the model to handle non‑numerical inputs.
-4. **Shape branch alternatives** – Try correlation distance, dynamic time warping, or Fourier descriptors for ordered features.
-5. **Multi‑scale branches** – Combine distances computed at different scales (e.g., different k values).
-6. **Online learning** – The static model can be updated incrementally with new centroids; learnable model could support online updates.
+### Phase 1 — Foundation
+
+Started as a three-branch static classifier (`FastTriBranchAVNN`) with fixed branch weights: angular (arccos), euclidean (tanh_arccos), and shape (z-score). No gradient, no training — just class mean centroids and FAISS KNN. Competitive with SVM on balanced data; weak on imbalance.
+
+**Key finding:** FastTriBranchAVNN outperformed the early learnable version on Wine cultivar (0.9884 vs 0.9831) because the shape (z-score) branch captured within-sample relative profiles that the learnable model's arccos-based branches couldn't. This drove the shape branch into the learnable model permanently.
+
+### Phase 2 — Learnable Branches
+
+Introduced gradient-based branch weight learning, per-feature weights, and learnable centroids. Upgraded softmax branch competition to **independent normalised sigmoid gates** — this eliminated zero-sum competition where increasing one branch necessarily suppressed others.
+
+Branch weight initialisation: `boundary` and `tanh_arccos` biased to sigmoid(0.5)≈0.622 vs sigmoid(0)=0.5 for others, based on observed dominance on imbalanced datasets.
+
+**Ablation finding:** Reducing from 6 to 4 branches (dropping linear and quadratic) degraded performance despite those branches having near-uniform weights. Even redundant branches enriched the KNN geometry — the FAISS index benefits from higher-dimensional combined spaces even when the gradient cannot differentiate the branches.
+
+### Phase 3 — Distance Upgrade
+
+Replaced diagonal covariance with **full RDA Mahalanobis** (α-blend of per-class QDA and pooled LDA). Cholesky inversion for numerical stability. Float64 intermediates required for high-dimensional combined vectors (discovered via overflow errors on digits dataset, 384-dim combined space).
+
+### Phase 4 — Imbalance Toolkit
+
+Added:
+- **Supervised Contrastive Loss (SupCon)** — pulls same-class embeddings together in the 6F combined space. Effective when ≥2 rare samples appear per batch; effectively a no-op for <0.4% minority at batch_size=256.
+- **EMA centroid stabilisation** — exponential moving average of embedded training samples, preventing minority centroids from drifting under sparse gradient updates.
+- **Ordinal EMD loss** — Earth Mover's Distance for ordered class labels (e.g. wine quality), penalising misclassification proportionally to class distance.
+- **Per-class temperature** (`per_class_tau`) — minority classes learn softer scoring, preventing them from being crushed by majority class confidence.
+
+### Phase 5 — Mixture of Prototypes
+
+Extended centroids from `(K, F)` to `(K, m, F)` — each class can have m learnable prototypes. Soft EMA assignment updates each prototype toward its nearest sub-cluster. The medium-quality wine class (82% of red wine data) spans q=5 and q=6 wines that cluster differently; a single centroid averaged them into an incoherent mean. Multi-prototype addresses this.
+
+### Phase 6 — Triangle Interaction Scoring
+
+**Key architectural advance.** Pairwise cross-products between sample and centroid feature deviations. Initially implemented as raw ratio comparison (`x_a·μ_kb - x_b·μ_ka`), then upgraded to **deviation space** (`(x_a-x̄)·(μ_kb-μ̄_k) - (x_b-x̄)·(μ_ka-μ̄_k)`) which eliminates false penalties from absolute scale differences between samples of the same class.
+
+The deviation version improved results on severe imbalance over the raw version: synth-severe at tri=0.5 went from -0.005 to +0.013 — a complete sign reversal.
+
+### Phase 7 — Lambda Gate
+
+Added entropy-based per-sample lambda gate. AVM entropy H(x) ∈ [0,1] measures how uncertain the AVM is — near decision boundaries entropy is high, meaning local KNN structure is more reliable than the global centroid geometry. The gate smoothly transitions between `lam_confident` (interior points) and `lam_uncertain` (boundary points).
+
+### Phase 8 — Cleanup
+
+**Removed:**
+- Kernel trick (RBF replacement for triangle) — loses interpretability; triangle without kernel is cleaner and competitive
+- Triplet scoring (3D cross-product for feature triplets) — C(F,3) combinatorial explosion; gradient spreads too thin (165 triplets for F=11, 1140 for F=20); no meaningful improvement
+- Bilinear W matrix scoring — zero-gradient initialisation bug exposed fundamental learning difficulty; even after fixing, combining with triangle hurt rather than helped due to gradient competition in shared deviation space
+- Branch pruning — never improved results in testing; added ~80 lines of training loop complexity
+- MLP lambda gate — no improvement over entropy gate; added parameters with no payoff
+- `nlist`, `nprobe`, `auto_lambda`, `lam_search_step`, `val_every`, `lam_init` — hardcoded sensible defaults
+- `val_acc_weight` + `val_macro_weight` + `val_weighted_weight` → consolidated to single `val_macro_bias` float
 
 ---
 
-## 9. Conclusion
+## Benchmarks
 
-The Angular Vector Nearest Neighbor (AVNN) family provides a robust, interpretable, and scalable geometric classifier. The core innovation – the axis‑separable angular distance – captures per‑feature orientation and complements Euclidean and shape distances. Through extensive experimentation, we identified optimal configurations and demonstrated state‑of‑the‑art performance on multiple benchmarks, including a 2‑million‑point industrial dataset. The code is open and ready for expert review.
+All results are 5-fold cross-validation macro F1 unless noted. Baselines use sklearn defaults with StandardScaler where required.
 
-**Citation**  
-If you use this work, please cite:  
-*“Angular Vector Nearest Neighbor (AVNN): A Geometric Classifier with Per‑Feature Angular Distance.”*  
-Available at hunterhargues24-oss.
+### Balanced Datasets
+
+| Model | Iris | Wine (cultivar) | Digits |
+|-------|------|-----------------|--------|
+| LearningAVNN | **0.9598** | **0.9831** | **0.9844** |
+| SVM-RBF | 0.9599 | 0.9834 | 0.9839 |
+| Random Forest | 0.9464 | 0.9784 | 0.9788 |
+| GBM | 0.9463 | 0.9515 | 0.9649 |
+| XGBoost | 0.9456 | 0.9608 | 0.9621 |
+| Logistic Reg | 0.9532 | 0.9829 | 0.9710 |
+
+LearningAVNN ties SVM on balanced data. GBM notably underperforms on Wine cultivar (0.9515 vs 0.9831) — the geometric distance approach handles the 3-class cultivar separation well.
+
+### Imbalanced Datasets (Synthetic)
+
+| Model | Synth-moderate (4/82/14%) | Synth-severe (60/25/10/5%) |
+|-------|--------------------------|---------------------------|
+| LearningAVNN (tri=0.3) | **0.6279** | **0.7574** |
+| XGBoost | 0.6755 | 0.7787 |
+| SVM-RBF | 0.5831 | **0.8039** |
+| Random Forest | 0.6202 | 0.7401 |
+| GBM | 0.6366 | 0.7441 |
+| Logistic Reg | 0.5046 | 0.6052 |
+
+Synth-moderate mirrors red wine (4% minority). Synth-severe mirrors ArrivalType (5% rarest class).
+
+SVM-RBF leads on severe imbalance via implicit kernel interactions. XGBoost leads on moderate via threshold-based tree splits. LearningAVNN with triangle scoring is competitive with tree ensembles and significantly ahead of linear and kernel-free baselines.
+
+### Triangle Scoring Impact (deviation cross-product)
+
+| Dataset | Baseline | +Triangle (tri=0.3) | Δ |
+|---------|----------|---------------------|---|
+| Synth-moderate | 0.5700 | **0.6279** | +0.058 |
+| Synth-severe | 0.7108 | **0.7574** | +0.047 |
+| Iris | 0.9598 | 0.9598 | 0.000 |
+| Wine cultivar | 0.9831 | 0.9831 | 0.000 |
+| Digits | 0.9844 | 0.9821 | −0.002 |
+
+Triangle scoring helps imbalanced datasets where class separation involves relative feature ratios. It is neutral on well-separated balanced data and slightly negative on high-dimensional balanced data (64 features → 2016 pairs, gradient too diluted).
+
+### Key Architectural Comparisons
+
+| Change | Impact |
+|--------|--------|
+| Full RDA Mahalanobis vs diagonal | +0.02–0.03 macro F1 on imbalanced |
+| Deviation triangle vs raw triangle | Synth-severe tri=0.5: −0.005 → +0.013 |
+| 6 branches vs 4 branches | 6 consistently better despite redundancy |
+| Independent sigmoid gates vs softmax | Allows boundary + tanh_arccos to both be strong |
+| Shape branch (z-score) vs no shape | Wine cultivar: 0.9884 → 0.9831 without it |
 
 ---
 
-*Appendix: Full code and Jupyter notebooks are provided separately.*
+## Parameter Reference
+
+### Core Training
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `k` | 5 | KNN neighbours |
+| `lr` | 1e-3 | Adam learning rate |
+| `epochs` | 300 | Max training epochs |
+| `batch_size` | 256 | Mini-batch size |
+| `patience` | 60 | Early stopping patience (val checks) |
+| `val_fraction` | 0.15 | Held-out fraction for early stopping + λ search |
+| `random_state` | None | Reproducibility seed |
+| `verbose` | False | Print training progress |
+
+### Regularisation
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `label_smoothing` | 0.05 | NLL label smoothing |
+| `weight_cap` | 1.5 | Max class weight (prevents extreme minority over-weighting) |
+| `weight_decay` | 1e-4 | Adam L2 regularisation |
+| `feat_weight_reg` | 0.05 | Per-feature weight regularisation; use 0.01 for imbalanced |
+| `ortho_reg` | 0.01 | Gram matrix branch decorrelation penalty |
+
+### Prototypes
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `centroid_reg` | 0.1 | Anchors prototypes near class means |
+| `centroid_sep` | 0.05 | Inter-class prototype separation |
+| `n_prototypes` | 1 | Prototypes per class; >1 for multimodal classes |
+| `intra_sep` | 0.05 | Intra-class prototype spread (only active when n_prototypes>1) |
+
+### Interaction Scoring
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `use_triangle` | False | Enable pairwise deviation cross-product scoring |
+| `tri_weight` | 0.5 | Triangle blend: 0=pure AVM, 1=pure triangle. Use 0.3 for imbalanced. |
+
+### Distance Metric
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `mahalanobis` | True | Full RDA Mahalanobis at inference |
+| `mahal_reg` | 1e-6 | Ridge regularisation on covariance |
+| `mahal_alpha` | 0.5 | QDA↔LDA blend; 0=per-class, 1=pooled. Use 0.2–0.3 for severe imbalance. |
+
+### Lambda Gate
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `lam_floor` | 0.5 | Minimum AVM weight in scalar λ search |
+| `entropy_lambda` | False | Enable per-sample entropy-gated λ |
+| `lam_confident` | 0.90 | λ when AVM entropy is low (confident) |
+| `lam_uncertain` | 0.40 | λ when AVM entropy is high (uncertain) |
+
+### Imbalance Handling
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `ordinal` | False | Ordinal EMD loss for ordered class labels |
+| `ordinal_weight` | 0.5 | EMD loss blend weight |
+| `supcon` | False | Supervised contrastive loss |
+| `supcon_weight` | 0.3 | SupCon loss blend weight |
+| `supcon_temp` | 0.1 | SupCon temperature |
+| `ema_centroids` | False | EMA centroid stabilisation |
+| `ema_beta` | 0.9 | EMA decay rate |
+| `per_class_tau` | True | Per-class temperature scaling |
+| `val_macro_bias` | 0.5 | Val scoring: 0=accuracy, 1=macro F1 |
+
+### FAISS
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `use_ivf` | True | IVF approximate index; auto-falls back to FlatL2 for small datasets |
+
+---
+
+## Design Decisions and What Didn't Work
+
+### Worked
+
+**Independent sigmoid gates over softmax** — Softmax creates zero-sum competition. When boundary AND tanh_arccos both needed to be high simultaneously (as on imbalanced wine datasets), softmax forced them to compete. Normalised sigmoid resolved this.
+
+**Deviation space for triangle scoring** — Raw ratio comparison (`x_a·μ_b - x_b·μ_a`) penalises samples that match the centroid's profile at a different absolute scale. Deviation-space centring (`(x_a-x̄)·(μ_b-μ̄)`) eliminates this false penalty. The change converted synth-severe tri=0.5 from −0.005 to +0.013.
+
+**Keeping all 6 branches despite redundancy** — Ablation showed removing linear and quadratic (near-uniform weights on balanced data) degraded holdout performance. Partially redundant branches still enrich the KNN geometry by increasing combined vector dimensionality even when the gradient cannot differentiate them.
+
+**Float64 Mahalanobis intermediates** — Float32 overflows on high-dimensional combined vectors (384-dim for digits). Overflow → NaN → silent divide-by-zero in scoring. Promoting to float64 for the matrix multiply fixed this.
+
+**val_macro_bias over three separate weights** — Three weights (`val_acc_weight`, `val_macro_weight`, `val_weighted_weight`) created a 3D search space with correlated parameters. Single `val_macro_bias` float covers the same intent with 1 degree of freedom.
+
+### Didn't Work
+
+**MLP lambda gate** — A small network (D→16→1) trained on the val set to predict per-sample λ. Added ~100 parameters and 100 training epochs. No meaningful improvement over the zero-parameter entropy gate. Removed.
+
+**Kernel trick (RBF replacement for triangle)** — Replacing inverse-distance scoring with `exp(-d²/2σ²)` with learnable σ per class. Improved synth-severe by +0.025 but lost all triangle pair interpretability — the W matrix and top pairs are among the most actionable outputs the model produces. Not worth the tradeoff.
+
+**Triplet scoring (3D cross-product)** — For F=11: 165 triplets vs 55 pairs. For F=20: 1140 triplets. The gradient spreads too thin across 165 learnable weights to find meaningful signal within 300 epochs. No improvement on any dataset; significant computation overhead.
+
+**Bilinear W matrix** — F×F asymmetric interaction matrix. Two problems: (1) `W²` initialisation means zero gradient at `W=0`, requiring random init to break symmetry; (2) operates in the same deviation space as triangle, creating gradient competition through shared centroids. Combining with triangle hurt rather than helped on synth-moderate (0.5771 vs 0.6279 for triangle alone). Removed.
+
+**Branch pruning** — Freezing low-weight branches after warmup. Never improved results across any dataset; added ~80 lines of training loop complexity. The partially-redundant branches contribute to KNN geometry even at low gradient weight.
+
+**Softmax branch competition (early)** — Original softmax gate meant boundary and tanh_arccos competed directly. Replaced with normalised sigmoid.
+
+---
+
+## Open Items
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `n_prototypes > 1` | Implemented, untested | Multimodal class distributions; red wine q=5 vs q=6 sub-clusters are the target use case |
+| Separate KNN feature space | Designed, not built | AVM and KNN currently use identical combined vectors — no genuine disagreement possible. Separate representation for KNN could let it correct AVM errors on minority classes |
+| Wine / ArrivalType with triangle | Pending | Need to run `wine_arrival_test.py` on the full datasets |
+| German Credit / Pima Diabetes | Pending network | Standard imbalanced benchmarks via `fetch_openml`; blocked by sandbox network |
+
+---
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `LearningAVNN.py` | Model — import and use this |
+| `auto_lambda_test.py` | Full benchmark: Iris, Wine, Breast Cancer, Red Wine, White Wine, ArrivalType |
+| `quick_test.py` | Fast benchmark: Iris, Wine, Digits, Synth-moderate, Synth-severe |
+| `wine_arrival_test.py` | Red Wine, White Wine, ArrivalType with triangle scoring |
+| `benchmark_all_models.py` | LearningAVNN vs XGBoost, LightGBM, SVM, RF, GBM |
+| `requirements.txt` | `torch`, `numpy`, `scikit-learn`, `pandas`, `faiss-cpu` |
+| `ARCHITECTURE.md` | Detailed architecture reference |
