@@ -1,0 +1,107 @@
+============================================================
+ArrivalType (oil/gas)
+============================================================
+  loaded 600,000 samples  /  20 features  /  4 classes  (5.3s)
+  class distribution:
+    1: 2,590  (0.4%)
+    2: 20,011  (3.3%)
+    3: 2,302  (0.4%)
+    4: 575,097  (95.8%)
+  split  train=570,000  test=30,000
+
+  fitting…
+  device=cuda  use_amp=True
+  branch_set='extended'  active branches: ['tac', 'b', 'cir', 'sq', 'mtac']
+  epoch  10  val_f1=0.3944  AVM[tan:0.34  bou:0.13  cir:0.26  squ:0.18  mir:0.09]
+  epoch  20  val_f1=0.3911  AVM[tan:0.38  bou:0.05  cir:0.32  squ:0.19  mir:0.06]
+  epoch  30  val_f1=0.3895  AVM[tan:0.39  bou:0.04  cir:0.32  squ:0.18  mir:0.06]
+  epoch  40  val_f1=0.3883  AVM[tan:0.49  bou:0.01  cir:0.35  squ:0.12  mir:0.03]
+  epoch  50  val_f1=0.3879  AVM[tan:0.66  bou:0.01  cir:0.23  squ:0.08  mir:0.02]
+  epoch  60  val_f1=0.3798  AVM[tan:0.85  bou:0.00  cir:0.07  squ:0.06  mir:0.02]
+  early stopping at epoch 60
+  centroid cls1: n=2338  drift=[p0=0.8762  p1=0.9080]
+  centroid cls2: n=18060  drift=[p0=0.8313  p1=0.8655]
+  centroid cls3: n=2078  drift=[p0=0.9874  p1=0.9612]
+  centroid cls4: n=519025  drift=[p0=0.8026  p1=0.8655]
+  Mahalanobis: per-prototype RDA (alpha=0.20 ridge=1e-06 D=100 K*m=8)
+  FAISS IVF: nlist=735 nprobe=10
+  lambda: confidence gate  val_f1=0.6247 (scalar=0.6147)
+
+  Accuracy    : 0.9655
+  Macro F1    : 0.6104
+  Weighted F1 : 0.9612
+  fit  : 70.4s
+  pred : 1.6s
+
+  Per-class metrics:
+              precision    recall  f1-score   support
+
+           1     0.7419    0.3566    0.4817       129
+           2     0.6144    0.3756    0.4662      1001
+           3     0.7077    0.4000    0.5111       115
+           4     0.9739    0.9911    0.9824     28755
+
+    accuracy                         0.9655     30000
+   macro avg     0.7595    0.5308    0.6104     30000
+weighted avg     0.9599    0.9655    0.9612     30000
+
+  Confusion matrix (rows=true, cols=pred):
+               1       2       3       4
+         1      46       0       0      83
+         2       0     376       7     618
+         3       0       7      46      62
+         4      16     229      12   28498
+
+  Disagreement (AVM vs KNN, higher = more conflict):
+    mean  : 0.1504
+    p50   : 0.1612
+    p90   : 0.1612
+    max   : 0.2134
+
+  Accuracy by disagreement quartile:
+    Q1  n=  7500  acc=0.8881
+    Q2  n=  7500  acc=0.9924
+    Q3  n=  7498  acc=0.9909
+    Q4  n=  7502  acc=0.9907
+
+Model summary:
+  Classes (4): 1: 0%  2: 3%  3: 0%  4: 96%
+  Train / val  : 541501 / 28499
+  Device       : cuda
+
+  Lambda  : [confidence gate]
+  Tau     : cls0:0.397  cls1:1.025  cls2:0.375  cls3:0.929
+  Val F1  : 0.3978
+
+  Mahalanobis : full RDA  (alpha=0.2  ridge=1e-06)
+  Ordinal EMD : False  (weight=0.5)
+  SupCon      : False  (weight=0.3  temp=0.1)
+  EMA         : True  (beta=0.9)
+  Dual bnd    : False
+  Branch set  : extended  (5 branches)
+  n_prototypes: 2  per_class_τ: True
+  ortho_reg   : 0.01
+
+  AVM branches (learned):
+    tanh_arccos : 0.3047
+    boundary    : 0.2315
+    circular    : 0.1892
+    squared     : 0.1602
+    mirror_tac  : 0.1144
+  KNN voter   : fixed-feature FAISS index (no learned weights)
+
+  Feature weights (top 5):
+    SecpriorArrivalType          2.1270
+    priorArrivalType             1.9113
+    SecpriorArrival              1.1874
+    priorArrival                 1.1385
+    priorcsgtbgatclose           1.0639
+  Feature weights (bottom 2):
+    lateralSlopeVal              0.4279
+    plunger                      0.4417
+
+  Centroid drift:
+    class 1: 0.8921  ███████████████████████████████████
+    class 2: 0.8484  █████████████████████████████████
+    class 3: 0.9743  ██████████████████████████████████████
+    class 4: 0.8341  █████████████████████████████████
