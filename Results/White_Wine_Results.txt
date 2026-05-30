@@ -1,0 +1,73 @@
+downloading https://archive.ics.uci.edu/ml/machine-learning-databases/wine-quality/winequality-white.csv
+============================================================
+White Wine Quality  (4,898 samples, 11 features, 3 classes)
+============================================================
+  class distribution:
+    0: 1,640  (33.5%)
+    1: 2,198  (44.9%)
+    2: 1,060  (21.6%)
+
+  Accuracy    : 0.6878 ± 0.0074
+  Macro F1    : 0.6847 ± 0.0057
+  Weighted F1 : 0.6881 ± 0.0078
+  Total time  : 43.0s  (8.6s per fold)
+
+  Per-class metrics (aggregated across folds):
+              precision    recall  f1-score   support
+
+           0     0.7689    0.6634    0.7123      1640
+           1     0.6534    0.7220    0.6860      2198
+           2     0.6584    0.6547    0.6566      1060
+
+    accuracy                         0.6878      4898
+   macro avg     0.6936    0.6801    0.6849      4898
+weighted avg     0.6931    0.6878    0.6884      4898
+
+  Confusion matrix (rows=true, cols=pred):
+               0       1       2
+     0      1088     499      53
+     1       304    1587     307
+     2        23     343     694
+
+Model summary (last fold):
+  Classes (3): 0: 33%  1: 45%  2: 22%
+  Train / val  : 3333 / 586
+  Device       : cuda
+
+  Lambda  : 0.850
+  Tau     : cls0:0.644  cls1:0.589  cls2:0.594
+  Val F1  : 0.4610
+
+  Mahalanobis : full RDA  (alpha=0.5  ridge=1e-06)
+  Ordinal EMD : False  (weight=0.5)
+  SupCon      : False  (weight=0.3  temp=0.1)
+  EMA         : True  (beta=0.9)
+  Dual bnd    : False
+  Branch set  : extended  (5 branches)
+  n_prototypes: 2  per_class_τ: True
+  ortho_reg   : 0.01
+
+  AVM branches (learned):
+    mirror_tac  : 0.2651
+    tanh_arccos : 0.2621
+    circular    : 0.2315
+    squared     : 0.1283
+    boundary    : 0.1130
+  KNN voter   : fixed-feature FAISS index (no learned weights)
+
+  Feature weights (top 5):
+    density                      1.5178
+    alcohol                      1.3462
+    chlorides                    1.3258
+    volatile acidity             1.1294
+    total sulfur dioxide         1.0091
+  Feature weights (bottom 2):
+    residual sugar               0.5299
+    sulphates                    0.6504
+
+  Centroid drift:
+    class 0: 0.1993  ███████
+    class 1: 0.1907  ███████
+    class 2: 0.1590  ██████
+
+  Lambda search: floor=0.5  chosen=0.850
