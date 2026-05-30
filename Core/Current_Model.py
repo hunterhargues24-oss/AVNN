@@ -1,55 +1,52 @@
 """
 LearningAVNN
 ============
-Geometric tabular classifier combining Angular Vector Machines (AVM)
-with FAISS-accelerated KNN and a suite of learned geometric corrections.
+Geometric tabular classifier combining a trained Angular Vector Machine
+(AVM) with a FAISS-accelerated KNN voter, blended at inference.
 
 Architecture
 ------------
   Input → MinMax normalise [-1,1]
-       → AVM: three-branch combined vector
+       → AVM: multi-branch combined vector (configurable via branch_set)
             → Mahalanobis inverse-distance to K×m learnable prototypes
-       → KNN: separate three-branch combined vector
+              → AVM probability  (trained end-to-end)
+       → KNN: linear + shape + quadratic combined vector
             → FAISS inverse-distance vote over k nearest training points
-       → λ·AVM + (1-λ)·KNN  (λ auto-tuned on val set post-training)
+              → KNN probability  (fixed features, post-fit)
+       → predict: λ·AVM + (1-λ)·KNN   (λ tuned on val, or per-sample
+                                       confidence gate)
 
-AVM Branches  (global structure — centroid proximity)
------------------------------------------------------
-  tanh_arccos  tanh(arccos(x)·0.8)·√fw   monotone nonlinear, centre-amplified
-               high at x≈-1, zero at x≈+1; most sensitive near x=0
-  boundary     √(‖x‖²-2x+1)              cross-feature coupling via ‖x‖²
-               optional dual_boundary adds negative-face distances (2F)
-  circular     √(1-x²)·√fw               symmetric extremeness at ±1
+This is late-fusion. The AVM trains end-to-end. The KNN voter is built
+from the same training data using a fixed geometric view once training
+completes, then blended at inference.
 
-  Gates: independent normalised-sigmoid (not softmax) — tac and boundary
-  both initialised with +0.5 bias head start over circular.
+AVM Branch Sets  (learned — global structure / centroid proximity)
+------------------------------------------------------------------
+  default      tac + bnd + cir         (3 branches, original)
+  extended     tac + bnd + cir + sq + mtac   (5 branches)
+  tac_family   tac + mtac + sq         (3 branches, all tac-shaped /
+                                        symmetric, no boundary coupling)
 
-KNN Branches  (local structure — neighbourhood similarity)
-----------------------------------------------------------
-  linear       x·√fw           signed magnitude, direct local proximity
-  shape        (x-μ)/σ         within-sample relative profile fingerprint
-  quadratic    x²·√fw          nonlinear extremeness, different from circular
+  Branch shapes:
+    tac     tanh(arccos(x)·0.8)         monotone decreasing, asymmetric,
+                                        middle-sensitive, saturated extremes
+    bnd     √(‖x‖²-2x+1)                cross-feature coupling via ‖x‖²;
+                                        optional dual extends to 2F
+    cir     √(1-x²)                     symmetric, peaks at x=0
+    sq      x²                          symmetric, peaks at x=±1 (opposite
+                                        curvature from cir)
+    mtac    tanh(arccos(-x)·0.8)        mirror of tac — monotone INCREASING,
+                                        captures positive-direction signal
 
-  KNN branch weights are parameters but receive no gradient (the KNN
-  space is not used in the training forward pass). They encode a fixed
-  geometric view that complements the learned AVM space.
-
-Triangle Scoring  (optional, use_triangle=True)
------------------------------------------------
-  Deviation cross-product for every feature pair (a,b) vs each prototype:
-    cross_{ab,k} = (x_a-x̄)·(μ_kb-μ̄_k) - (x_b-x̄)·(μ_ka-μ̄_k)
-
-  Zero when the sample's RELATIVE PROFILE matches the centroid's profile —
-  measures pairwise profile similarity independently of absolute scale.
-  Captures "high alcohol AND low volatile acidity" interactions that
-  axis-aligned branches cannot represent. Blended into AVM via tri_weight.
-
-Learnable Prototypes
---------------------
-  K×m prototype positions (nn.Parameter). n_prototypes=1 → single centroid.
-  n_prototypes>1 → multimodal class representation (e.g. bimodal quality).
-  centroid_sep / intra_sep — cached per epoch, prototypes pushed apart
-  during training via detached separation loss.
+Performance
+-----------
+  device='auto'      Picks 'cuda' if available, else 'cpu'.
+  Mixed precision    Automatic on CUDA via torch.amp.autocast — roughly 2×
+                     forward/backward throughput on modern GPUs.
+  Index-on-demand    Shuffle indices once per epoch, slice X_tr_t inside
+                     the batch loop. No full-tensor copy per epoch.
+  Cached class means EMA path with m=1 reuses class means computed once
+                     before training (they don't change).
 
 Imbalance Handling
 ------------------
@@ -65,8 +62,8 @@ Key Parameters
 --------------
   k              int    KNN neighbours
   n_prototypes   int    prototypes per class
-  use_triangle   bool   pairwise profile matching
-  tri_weight     float  AVM/triangle blend (0=AVM only, 1=triangle only)
+  branch_set     str    'default', 'extended', or 'tac_family'
+  device         str    'auto', 'cuda', 'cpu', or a specific device string
   mahal_alpha    float  RDA blend (0=QDA, 1=LDA)
   lam_floor      float  minimum AVM weight in lambda grid search
   val_macro_bias float  0=accuracy, 1=macro F1 for early stopping
@@ -91,14 +88,50 @@ except ImportError:
     _HAS_FAISS = False
 
 
+# ── Branch registry ──────────────────────────────────────────────────────────
+# Single source of truth for branch definitions. Adding a new branch means
+# adding to BRANCH_NAMES + the dispatch in _avm_features + the dispatch in
+# _make_avm_combined (post-fit). Three places, no more.
+BRANCH_SETS = {
+    'default':    ['tac', 'b',    'cir'],
+    'extended':   ['tac', 'b',    'cir', 'sq', 'mtac'],
+    'tac_family': ['tac', 'mtac', 'sq'],
+}
+
+# Init values for raw gate parameters (pre-sigmoid).
+BRANCH_INITS = {
+    'tac':  0.5,   # +0.5 head start (original design)
+    'b':    0.5,   # +0.5 head start (original design)
+    'cir':  0.0,
+    'sq':   0.0,   # let gradient decide
+    'mtac': 0.0,   # let gradient decide
+}
+
+# Display names for summary()
+BRANCH_DISPLAY = {
+    'tac':  'tanh_arccos',
+    'b':    'boundary',
+    'cir':  'circular',
+    'sq':   'squared',
+    'mtac': 'mirror_tac',
+}
+
+
+def _resolve_device(spec):
+    """Map 'auto' to cuda/cpu; otherwise pass through to torch.device."""
+    if spec == 'auto':
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    return torch.device(spec)
+
+
 class LearningAVNN(BaseEstimator, ClassifierMixin):
 
-    def __init__(self, k=5, lr=1e-3, epochs=300, batch_size=256,
+    def __init__(self, k=5, lr=4e-3, epochs=300, batch_size=1024,
                  patience=60, val_fraction=0.15, label_smoothing=0.05,
                  weight_cap=1.5, weight_decay=1e-4, feat_weight_reg=0.05,
                  centroid_reg=0.1, centroid_sep=0.05,
                  n_prototypes=1, intra_sep=0.05,
-                 use_triangle=False, tri_weight=0.5,
+                 branch_set='default',
                  use_dual_boundary=False,
                  ortho_reg=0.01,
                  mahalanobis=True, mahal_reg=1e-6, mahal_alpha=0.5,
@@ -110,6 +143,7 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                  use_ivf=True,
                  supcon=False, supcon_weight=0.3, supcon_temp=0.1,
                  ema_centroids=False, ema_beta=0.9,
+                 device='auto', use_amp=True,
                  random_state=None, verbose=False):
         self.k                   = k
         self.lr                  = lr
@@ -125,8 +159,7 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         self.centroid_sep        = centroid_sep
         self.n_prototypes        = n_prototypes
         self.intra_sep           = intra_sep
-        self.use_triangle        = use_triangle
-        self.tri_weight          = tri_weight
+        self.branch_set          = branch_set
         self.use_dual_boundary   = use_dual_boundary
         self.ortho_reg           = ortho_reg
         self.mahalanobis         = mahalanobis
@@ -146,6 +179,8 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         self.supcon_temp         = supcon_temp
         self.ema_centroids       = ema_centroids
         self.ema_beta            = ema_beta
+        self.device              = device
+        self.use_amp             = use_amp
         self.random_state        = random_state
         self.verbose             = verbose
 
@@ -163,14 +198,21 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
     class _Net(nn.Module):
 
         def __init__(self, centroids, K, n_feat, m=1,
-                     per_class_tau=False, use_triangle=False,
+                     branch_set='default',
+                     per_class_tau=False,
                      use_dual_boundary=False, eps=1e-7):
             super().__init__()
             self.K, self.m, self.n_feat, self.eps = K, m, n_feat, eps
-            self.per_class_tau    = per_class_tau
-            self.use_triangle     = use_triangle
+            self.per_class_tau     = per_class_tau
             self.use_dual_boundary = use_dual_boundary
-            self._sep_cache       = None
+            self.branch_set        = branch_set
+            self._sep_cache        = None
+
+            if branch_set not in BRANCH_SETS:
+                raise ValueError(
+                    f"branch_set must be one of {list(BRANCH_SETS)}, "
+                    f"got {branch_set!r}")
+            self.active_branches = BRANCH_SETS[branch_set]
 
             self.centroids = nn.Parameter(centroids.clone())
             self.register_buffer("centroid_anchor", centroids.clone())
@@ -180,50 +222,23 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             else:
                 self.log_tau = nn.Parameter(torch.tensor(-0.5))
 
-            if use_triangle:
-                n_pairs = n_feat * (n_feat - 1) // 2
-                self.log_tau_tri = nn.Parameter(torch.tensor(-0.5))
-                self.log_w_pairs = nn.Parameter(torch.zeros(n_pairs))
-                # Precompute pair indices once — avoids Python loop every batch
-                pa = torch.tensor([a for a in range(n_feat)
-                                   for b in range(a+1, n_feat)], dtype=torch.long)
-                pb = torch.tensor([b for a in range(n_feat)
-                                   for b in range(a+1, n_feat)], dtype=torch.long)
-                self.register_buffer('_tri_pa', pa)
-                self.register_buffer('_tri_pb', pb)
+            # AVM branch gates — one raw weight per active branch.
+            # ParameterDict so we only create what we use (no dead weights
+            # fighting weight_decay).
+            self.raw_w = nn.ParameterDict({
+                name: nn.Parameter(torch.tensor(BRANCH_INITS[name]))
+                for name in self.active_branches
+            })
 
-
-            # ── AVM branches (global structure — centroid proximity) ──────────
-            # AVM branches: tac, boundary, circular
-            self.raw_w_tac = nn.Parameter(torch.tensor(0.5))   # ↑ head start
-            self.raw_w_b   = nn.Parameter(torch.tensor(0.5))   # ↑ head start
-            self.raw_w_cir = nn.Parameter(torch.tensor(0.0))
-
-
-            # ── KNN branches (local structure — neighbourhood similarity) ─────
-            self.raw_w_lin  = nn.Parameter(torch.tensor(0.0))
-            self.raw_w_s    = nn.Parameter(torch.tensor(0.0))
-            self.raw_w_sq   = nn.Parameter(torch.tensor(0.0))
-
-            # Feature weights — shared across AVM and KNN spaces
+            # Feature weights — shared with the KNN voter post-fit
             self.raw_feat_w = nn.Parameter(torch.zeros(n_feat))
 
         def _avm_branch_weights(self):
-            """AVM branches: tac, boundary, circular — normalised sigmoid."""
-            raw   = torch.stack([self.raw_w_tac, self.raw_w_b, self.raw_w_cir])
+            """Active branches — normalised sigmoid over active gates only."""
+            raw   = torch.stack(
+                [self.raw_w[name] for name in self.active_branches])
             gates = torch.sigmoid(raw)
             return gates / (gates.sum() + 1e-10)
-
-        def _knn_branch_weights(self):
-            """KNN branches: linear, shape, quadratic — normalised sigmoid."""
-            raw   = torch.stack([self.raw_w_lin, self.raw_w_s, self.raw_w_sq])
-            gates = torch.sigmoid(raw)
-            return gates / (gates.sum() + 1e-10)
-
-        def _branch_weights(self):
-            """Combined 6-weight view — AVM then KNN."""
-            return torch.cat([self._avm_branch_weights(),
-                              self._knn_branch_weights()])
 
         def _feat_weights(self):
             w = torch.softmax(self.raw_feat_w, dim=0)
@@ -237,144 +252,72 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             dual=True:  (N, 2F) distances to +e_f and -e_f interleaved.
               pos: ||x - e_f||² = ||x||² - 2x_f + 1
               neg: ||x + e_f||² = ||x||² + 2x_f + 1
-            The neg distances give the AVM direct signal about proximity
-            to the negative face — complementary to the tac branch.
             """
             norm_sq     = (x**2).sum(dim=1, keepdim=True)
             dist_sq_pos = (norm_sq - 2.0*x + 1.0).clamp(min=eps)
             if not dual:
                 return torch.sqrt(dist_sq_pos)
             dist_sq_neg = (norm_sq + 2.0*x + 1.0).clamp(min=eps)
-            # Interleave: [pos_f0, neg_f0, pos_f1, neg_f1, ...]
-            stacked = torch.stack([dist_sq_pos, dist_sq_neg], dim=2)  # (N,F,2)
-            return torch.sqrt(stacked.reshape(stacked.shape[0], -1))   # (N,2F)
+            stacked = torch.stack([dist_sq_pos, dist_sq_neg], dim=2)
+            return torch.sqrt(stacked.reshape(stacked.shape[0], -1))
+
+        def _branch_feature(self, name, x, wf, sqwf):
+            """
+            Compute a single branch's per-feature output (pre-gate-weighting).
+            One dispatch table keeps the torch path aligned with the post-fit
+            numpy path (_np_branch_feature in fit()).
+            """
+            eps = self.eps
+            if name == 'tac':
+                a = torch.acos(torch.clamp(x, -1+eps, 1-eps))
+                return torch.tanh(a * 0.8) * sqwf
+            if name == 'b':
+                return self._boundary_dists(x, eps, dual=self.use_dual_boundary)
+            if name == 'cir':
+                return torch.sqrt(torch.clamp(1.0 - x*x, min=eps)) * sqwf
+            if name == 'sq':
+                return (x * x) * sqwf
+            if name == 'mtac':
+                a = torch.acos(torch.clamp(-x, -1+eps, 1-eps))
+                return torch.tanh(a * 0.8) * sqwf
+            raise ValueError(f"unknown branch: {name}")
 
         def _avm_features(self, x, wf):
-            """
-            AVM combined vector — global structure branches.
-            tac + boundary (F or 2F if dual) + circular.
-            """
-            eps  = self.eps
+            """AVM combined vector — concat of all active branches, gated."""
             sqwf = wf.sqrt()
             wa   = self._avm_branch_weights()
-
-            a   = torch.acos(torch.clamp(x, -1+eps, 1-eps))
-            tac = torch.tanh(a * 0.8) * sqwf
-
-            bnd = self._boundary_dists(x, eps, dual=self.use_dual_boundary)
-
-            cir = torch.sqrt(torch.clamp(1.0 - x*x, min=eps)) * sqwf
-
-            return torch.cat([
-                wa[0].sqrt() * tac,
-                wa[1].sqrt() * bnd,
-                wa[2].sqrt() * cir,
-            ], dim=1)
-
-        def _knn_features(self, x, wf):
-            """KNN combined vector (3F): linear + shape + quadratic."""
-            eps  = self.eps
-            sqwf = wf.sqrt()
-            wk   = self._knn_branch_weights()
-            lin  = x * sqwf
-            mu   = x.mean(1, keepdim=True)
-            sd   = x.std(1, keepdim=True).clamp(min=eps)
-            shp  = (x - mu) / sd
-            sqd  = x * x * sqwf
-            return torch.cat([
-                wk[0].sqrt() * lin,
-                wk[1].sqrt() * shp,
-                wk[2].sqrt() * sqd,
-            ], dim=1)
-
-        def _triangle_score(self, x, proto_flat):
-            """
-            Deviation triangle cross-product scoring.
-
-            Computes cross-products in deviation space — both sample and
-            centroid are centred by their own feature means before the
-            wedge product:
-
-              dx_a  = x_a  - mean(x)        sample deviation for feature a
-              dμ_ka = μ_ka - mean(μ_k)      centroid deviation for feature a
-
-              cross_{ab,k} = dx_a * dμ_kb - dx_b * dμ_ka
-
-            Zero when the sample's RELATIVE PROFILE (which features are
-            above/below its own mean) matches the centroid's relative profile
-            for this pair — regardless of absolute scale differences.
-
-            Strictly more expressive than raw ratio comparison:
-              raw:       x_a/x_b  vs  μ_ka/μ_kb
-              deviation: (x_a-x̄)/(x_b-x̄)  vs  (μ_ka-μ̄_k)/(μ_kb-μ̄_k)
-
-            A sample matching the centroid's profile at a different absolute
-            scale now correctly yields near-zero cross-product.
-            Complements the shape branch (z-score) by capturing the same
-            deviation concept at the pairwise interaction level.
-            """
-            F   = self.n_feat
-            eps = self.eps
-
-            # Use precomputed pair index buffers — not rebuilt every batch
-            pa = self._tri_pa
-            pb = self._tri_pb
-
-            w_pairs = torch.nn.functional.softplus(self.log_w_pairs)
-
-            # Centre sample and prototype by their own feature means
-            x_dev  = x          - x.mean(1, keepdim=True)          # (N, F)
-            mu_dev = proto_flat - proto_flat.mean(1, keepdim=True)  # (K*m, F)
-
-            x_a  = x_dev[:, pa]    # (N, P)
-            x_b  = x_dev[:, pb]
-            mu_a = mu_dev[:, pa]   # (K*m, P)
-            mu_b = mu_dev[:, pb]
-
-            cross = (x_a.unsqueeze(1) * mu_b.unsqueeze(0)
-                   - x_b.unsqueeze(1) * mu_a.unsqueeze(0))  # (N, K*m, P)
-
-            return torch.sqrt((w_pairs * cross ** 2).sum(-1) + eps)  # (N, K*m)
+            parts = []
+            for i, name in enumerate(self.active_branches):
+                feat = self._branch_feature(name, x, wf, sqwf)
+                parts.append(wa[i].sqrt() * feat)
+            return torch.cat(parts, dim=1)
 
         def forward(self, x):
             """
-            Split-branch forward pass.
-            AVM scores distances in the global-structure space (tac+bnd+cir).
-            Embeddings returned are AVM space — used for SupCon and ortho_reg.
-            Local neighbour scoring uses the same AVM space.
-            Returns (avm_proba, feat_weights, avm_embeddings).
+            AVM forward pass — scores distances in the active branch space
+            to K*m learnable prototypes. Returns (proba, fw, embeddings).
             """
             wf   = self._feat_weights()
             N    = x.shape[0]
             K, m = self.K, self.m
             tau  = torch.exp(self.log_tau)
 
-            # AVM: global structure space (tac + bnd + cir)
-            fx_avm     = self._avm_features(x, wf)                # (N, 3F)
+            fx_avm     = self._avm_features(x, wf)
             proto_flat = self.centroids.reshape(K*m, self.n_feat)
-            fy_avm     = self._avm_features(proto_flat, wf)       # (K*m, 3F)
+            fy_avm     = self._avm_features(proto_flat, wf)
 
             sq_x   = (fx_avm**2).sum(1, keepdim=True)
             sq_y   = (fy_avm**2).sum(1)
             dot    = fx_avm @ fy_avm.T
             d_flat = torch.sqrt(torch.clamp(
-                sq_x + sq_y[None,:] - 2.0*dot, min=self.eps))    # (N, K*m)
+                sq_x + sq_y[None,:] - 2.0*dot, min=self.eps))
             d      = d_flat.reshape(N, K, m)
 
             tau_e  = tau.reshape(1,K,1) if (K>1 and tau.dim()>0) else tau
-            raw    = (1.0 / (d / tau_e + self.eps)).sum(2)        # (N, K)
-            proba_avm = raw / raw.sum(-1, keepdim=True)
+            raw    = (1.0 / (d / tau_e + self.eps)).sum(2)
+            proba  = raw / raw.sum(-1, keepdim=True)
 
-            # Triangle: independent probability vector (not blended into AVM)
-            proba_tri = None
-            if self.use_triangle:
-                tau_tri   = torch.exp(self.log_tau_tri)
-                t_flat    = self._triangle_score(x, proto_flat)
-                t         = t_flat.reshape(N, K, m)
-                tri_raw   = (1.0 / (t / tau_tri + self.eps)).sum(2)
-                proba_tri = tri_raw / tri_raw.sum(-1, keepdim=True)
-
-            return proba_avm, wf, fx_avm, proba_tri
+            return proba, wf, fx_avm
 
     # ── loss ──────────────────────────────────────────────────────────────────
 
@@ -389,88 +332,50 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
     def _supcon_loss(self, embeddings, targets):
         """
         Supervised Contrastive Loss (Khosla et al., 2020).
-
-        For each anchor i, pulls all same-class embeddings closer and pushes
-        all different-class embeddings further in the combined vector space.
-
-        L = sum_i { -1/|P(i)| * sum_{p in P(i)} log [
-              exp(sim(z_i, z_p) / T) /
-              sum_{a != i} exp(sim(z_i, z_a) / T)
-            ]}
-
-        Where:
-          sim = cosine similarity between L2-normalised embeddings
-          P(i) = set of indices with same label as i (excluding i itself)
-          T = temperature (lower = sharper, more discriminative)
-
-        Why this helps on imbalanced data:
-          NLL only penalises wrong centroid predictions.
-          SupCon explicitly pulls the ~10 minority class samples in a batch
-          together while pushing them away from all ~246 majority samples.
-          The minority centroid becomes a tight, stable cluster rather than
-          a diffuse cloud.
+        Pulls same-class AVM embeddings together, pushes apart different.
         """
-        # L2-normalise embeddings for cosine similarity
-        z = nn.functional.normalize(embeddings, dim=1)  # (N, D)
+        z = nn.functional.normalize(embeddings, dim=1)
         N = z.shape[0]
 
-        # Cosine similarity matrix scaled by temperature
-        sim = (z @ z.T) / self.supcon_temp             # (N, N)
+        sim = (z @ z.T) / self.supcon_temp
+        labels   = targets.unsqueeze(1)
+        pos_mask = (labels == labels.T).float()
+        pos_mask.fill_diagonal_(0)
 
-        # Build same-class mask (positive pairs), exclude diagonal
-        labels    = targets.unsqueeze(1)               # (N, 1)
-        pos_mask  = (labels == labels.T).float()       # (N, N)
-        pos_mask.fill_diagonal_(0)                     # exclude self
-
-        # Number of positives per anchor — skip anchors with no positives
-        n_pos = pos_mask.sum(1)                        # (N,)
+        n_pos = pos_mask.sum(1)
         valid = n_pos > 0
 
         if not valid.any():
             return torch.tensor(0.0, device=embeddings.device)
 
-        # Subtract max for numerical stability (log-sum-exp trick)
         sim_max, _ = sim.max(dim=1, keepdim=True)
         exp_sim    = torch.exp(sim - sim_max.detach())
 
-        # Zero out self-similarity from denominator
         eye        = torch.eye(N, device=embeddings.device)
         exp_sim    = exp_sim * (1.0 - eye)
 
-        # Log probability of each positive pair
         log_prob   = (sim - sim_max.detach()) - torch.log(
             exp_sim.sum(1, keepdim=True).clamp(min=1e-10))
 
-        # Mean log-prob over positives per anchor
         mean_log_prob = (pos_mask * log_prob).sum(1) / n_pos.clamp(min=1)
-
         return -mean_log_prob[valid].mean()
 
     def _loss(self, probs, targets, class_weights, fw=None, embeddings=None):
-        """
-        fw: pre-computed feat_weights tensor from the forward pass.
-        Passing it avoids a third softmax call per batch — forward() already
-        computed it, _loss() needs it for fw_reg. If None, recomputes.
-        """
         K   = probs.shape[1]
         nll = nn.NLLLoss(weight=class_weights)(
                   torch.log(probs.clamp(1e-10)), targets)
-        s   = self.label_smoothing / K
-        ce  = (1 - self.label_smoothing + s) * nll + s * (
-                   -torch.log(probs.clamp(1e-10)).mean())
+        # Label smoothing: (1-α)*NLL + α * mean_k(-log p_k)
+        smooth_term = -torch.log(probs.clamp(1e-10)).mean(dim=1).mean()
+        ce  = (1.0 - self.label_smoothing) * nll + self.label_smoothing * smooth_term
 
-        # Feature weight regularisation
         _fw = fw if fw is not None else self.net_._feat_weights()
         fw_reg = self.feat_weight_reg * (_fw - 1.0).pow(2).mean()
 
-        # Centroid anchor
         c_anchor = self.centroid_reg * (
             self.net_.centroids - self.net_.centroid_anchor
         ).pow(2).mean()
 
         # Centroid separation — cached per epoch, reused across batches.
-        # Centroids change by tiny amounts per batch so the approximation
-        # error is negligible vs the cost of recomputing n_batch times.
         if self.net_._sep_cache is None:
             if self.net_.K > 1:
                 _K, _m = self.net_.K, self.net_.m
@@ -486,9 +391,9 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                     inter = -self.centroid_sep * (
                         c_dists * inter_mask).sum() / inter_mask.sum()
                 else:
-                    inter = torch.tensor(0.0)
+                    inter = torch.tensor(0.0, device=c_dists.device)
 
-                intra = torch.tensor(0.0)
+                intra = torch.tensor(0.0, device=c_dists.device)
                 if _m > 1 and self.intra_sep > 0.0:
                     for k in range(_K):
                         proto_k = self.net_.centroids[k]
@@ -501,7 +406,8 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
 
                 self.net_._sep_cache = (inter + intra).detach()
             else:
-                self.net_._sep_cache = torch.tensor(0.0)
+                self.net_._sep_cache = torch.tensor(
+                    0.0, device=self.net_.centroids.device)
         c_sep = self.net_._sep_cache
 
         if self.ordinal and K >= 2:
@@ -529,20 +435,16 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
 
     def _val_score(self, y_true, y_pred):
         """
-        Composite validation metric computed from a single confusion matrix.
-
-        sklearn's accuracy_score, f1_score(macro), f1_score(weighted) each
-        build their own internal representation — three passes over the data.
-        Computing the confusion matrix once and deriving all three metrics from
-        it is 4.5x faster on typical validation set sizes (150-500 samples).
+        Composite validation metric from a single confusion matrix.
+        Faster than three sklearn metric calls.
         """
         from sklearn.metrics import confusion_matrix
         labels = np.arange(len(self.classes_))
         cm     = confusion_matrix(y_true, y_pred, labels=labels).astype(float)
         tp     = np.diag(cm)
         total  = cm.sum()
-        sup    = cm.sum(1)          # per-class support
-        pred_s = cm.sum(0)          # per-class predicted count
+        sup    = cm.sum(1)
+        pred_s = cm.sum(0)
 
         acc  = tp.sum() / (total + 1e-10)
         prec = np.zeros_like(f1 := np.zeros(len(labels)))
@@ -565,6 +467,16 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         y = np.asarray(y)
         rng = np.random.default_rng(self.random_state)
 
+        if self.branch_set not in BRANCH_SETS:
+            raise ValueError(
+                f"branch_set must be one of {list(BRANCH_SETS)}, "
+                f"got {self.branch_set!r}")
+
+        # ── Device resolution ────────────────────────────────────────────────
+        device = _resolve_device(self.device)
+        self.device_ = device
+        use_amp = bool(self.use_amp) and device.type == 'cuda'
+
         self.classes_ = np.unique(y)
         K      = len(self.classes_)
         n_feat = X.shape[1]
@@ -574,8 +486,10 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
 
         if self.random_state is not None:
             torch.manual_seed(self.random_state)
+            if device.type == 'cuda':
+                torch.cuda.manual_seed_all(self.random_state)
 
-        # Stratified train/val split — minimum K*5 samples per class in val
+        # Stratified train/val split
         min_val  = max(K * 5, int(len(X) * 0.05))
         n_val    = max(min_val, int(len(X) * self.val_fraction))
         if self.verbose and self.val_fraction == 0:
@@ -600,145 +514,153 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         X_tr_n = self._norm_apply(X_tr)
         X_va_n = self._norm_apply(X_va)
 
+        # All training/val tensors created directly on device.
         def tt(a, long=False):
             return torch.tensor(a,
-                dtype=torch.long if long else torch.float32)
+                dtype=torch.long if long else torch.float32,
+                device=device)
 
         cw   = compute_class_weight('balanced', classes=self.classes_,
                                     y=y[tr_idx])
-        cw_t = torch.tensor(cw, dtype=torch.float32).clamp(
+        cw_t = torch.tensor(cw, dtype=torch.float32, device=device).clamp(
             max=self.weight_cap)
         cw_t = cw_t / cw_t.sum() * K
 
         m = max(1, int(self.n_prototypes))
 
-        # Initialise prototypes — shape (K, m, F).
-        # Each prototype starts at the class mean. When m>1, prototypes
-        # are identical at init; intra-class separation pushes them apart
-        # during training, guided by the NLL gradient.
-        # Small jitter breaks symmetry so they don't stay identical.
+        # Prototypes initialised at class mean with small jitter for m>1
         rng_proto = np.random.default_rng(
             (self.random_state or 0) + 1)
         class_means = np.stack([
-            X_tr_n[y_tr == i].mean(0) for i in range(K)])  # (K, F)
+            X_tr_n[y_tr == i].mean(0) for i in range(K)])
         proto_init  = np.tile(
-            class_means[:, None, :], (1, m, 1))             # (K, m, F)
+            class_means[:, None, :], (1, m, 1))
         if m > 1:
             jitter = rng_proto.normal(
                 0, 0.05, proto_init.shape).astype(np.float32)
             proto_init = proto_init + jitter
 
-        centroids = tt(proto_init)    # (K, m, F)
+        centroids = tt(proto_init)
 
         self.net_ = self._Net(centroids, K, n_feat, m=m,
+                              branch_set=self.branch_set,
                               per_class_tau=self.per_class_tau,
-                              use_triangle=self.use_triangle,
-                              use_dual_boundary=self.use_dual_boundary)
-        self.net_._tri_weight = float(self.tri_weight)
+                              use_dual_boundary=self.use_dual_boundary
+                              ).to(device)
+
+        if self.verbose:
+            print(f"  device={device}  use_amp={use_amp}")
+            print(f"  branch_set={self.branch_set!r}  "
+                  f"active branches: {self.net_.active_branches}")
 
         opt = optim.Adam(self.net_.parameters(),
                          lr=self.lr, weight_decay=self.weight_decay)
         sch = optim.lr_scheduler.CosineAnnealingWarmRestarts(
                   opt, T_0=30, T_mult=2, eta_min=1e-5)
+        scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
-        # Pre-bake tensors — no DataLoader overhead
         X_tr_t = tt(X_tr_n)
         y_tr_t = tt(y_tr, long=True)
         X_va_t = tt(X_va_n)
-        # Cache val combined features — X_va_n never changes so
-        # _make_combined(X_va_n) produces the same result every val check.
-        # Pre-compute once here; reuse in every validation epoch.
-        # NOTE: this cache is in PyTorch space (for net forward), not numpy.
-        # It is invalidated implicitly — we never call _make_combined on val
-        # during training, only net_(X_va_t) which uses learnable weights.
-        # The PyTorch path doesn't use _make_combined so this is fine.
         N_tr   = len(X_tr_t)
         bs     = self.batch_size
         n_batch = max(1, N_tr // bs)
 
-        # val_every: validate every N epochs to reduce overhead.
-        # patience counts EPOCHS not validation events — divide internally
-        # so patience=60 always means 60 epochs regardless of val_every.
-        val_every   = 5
+        # Cache class means once — they don't change with epochs and they
+        # drive the m=1 EMA path. Big memory-bandwidth win on imbalanced
+        # data (avoid re-copying the majority class every epoch).
+        class_means_t = None
+        if self.ema_centroids and m == 1:
+            with torch.no_grad():
+                class_means_t = torch.stack([
+                    X_tr_t[y_tr_t == cls].mean(0) for cls in range(K)
+                ])  # (K, F), on device
+
+        val_every = 5
         best_f1, best_state, wait = -1.0, None, 0
         WARMUP = 20
 
         for epoch in range(self.epochs):
-            perm   = rng.permutation(N_tr)
-            X_shuf = X_tr_t[perm]
-            y_shuf = y_tr_t[perm]
+            # Index-on-demand shuffle: permutation tensor lives on device,
+            # we slice it for each batch and gather rows from X_tr_t.
+            # No full-tensor copy per epoch (was X_shuf = X_tr_t[perm]).
+            perm = torch.from_numpy(rng.permutation(N_tr)).to(
+                device, non_blocking=True)
 
             self.net_.train()
-            self.net_._sep_cache = None   # invalidate once per epoch
+            self.net_._sep_cache = None
             for i in range(n_batch):
-                xb = X_shuf[i*bs:(i+1)*bs]
-                yb = y_shuf[i*bs:(i+1)*bs]
-                opt.zero_grad()
-                proba, fw, emb, proba_tri = self.net_(xb)
-                # Triangle blended before loss — avoids centroid gradient conflict.
-                # Both AVM and triangle train through the same NLL signal.
-                # Triangle's own params (log_w_pairs, log_tau_tri) still get
-                # gradient; only centroid conflict is avoided.
-                if proba_tri is not None:
-                    tw    = float(self.tri_weight)
-                    proba = (1.0 - tw) * proba + tw * proba_tri
-                loss = self._loss(proba, yb, cw_t, fw=fw,
-                                  embeddings=emb if self.supcon else None)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    self.net_.parameters(), 1.0)
-                opt.step()
+                idx = perm[i*bs:(i+1)*bs]
+                xb  = X_tr_t[idx]
+                yb  = y_tr_t[idx]
+
+                opt.zero_grad(set_to_none=True)
+
+                if use_amp:
+                    with torch.amp.autocast('cuda'):
+                        proba, fw, emb = self.net_(xb)
+                        loss = self._loss(
+                            proba, yb, cw_t, fw=fw,
+                            embeddings=emb if self.supcon else None)
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.net_.parameters(), 1.0)
+                    scaler.step(opt)
+                    scaler.update()
+                else:
+                    proba, fw, emb = self.net_(xb)
+                    loss = self._loss(
+                        proba, yb, cw_t, fw=fw,
+                        embeddings=emb if self.supcon else None)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        self.net_.parameters(), 1.0)
+                    opt.step()
             sch.step()
 
-            # EMA centroid update — after each epoch, blend learnable centroid
-            # positions toward the actual mean of embedded training samples.
-            # This stabilises minority class centroids whose backprop gradient
-            # signal is weak (few samples → small contribution to NLL loss).
-            # EMA provides a direct geometric pull toward the empirical cluster.
+            # EMA centroid update
             if self.ema_centroids:
                 self.net_.eval()
                 with torch.no_grad():
-                    for cls in range(K):
-                        mask     = (y_tr_t == cls)
-                        if mask.sum() == 0:
-                            continue
-                        cls_X    = X_tr_t[mask]          # (n_k, F)
-                        protos   = self.net_.centroids[cls]  # (m, F)
-
-                        if m == 1:
-                            # Single prototype — direct EMA
-                            cls_mean = cls_X.mean(0)
-                            self.net_.centroids.data[cls, 0] = (
-                                self.ema_beta       * protos[0]
-                                + (1.0 - self.ema_beta) * cls_mean)
-                        else:
-                            # Multiple prototypes — soft assignment.
-                            # Subsample for large classes to avoid O(N*m) cdist.
-                            # Soft assignment only needs to distinguish which
-                            # prototype is closer — doesn't need the full set.
+                    if m == 1:
+                        # Vectorised: blend all centroids against cached means.
+                        # No per-class mask, no per-class allocation.
+                        self.net_.centroids.data[:, 0] = (
+                            self.ema_beta * self.net_.centroids.data[:, 0]
+                            + (1.0 - self.ema_beta) * class_means_t)
+                    else:
+                        # Soft-assigned weighted mean — depends on current
+                        # prototype positions, has to run per epoch.
+                        for cls in range(K):
+                            mask = (y_tr_t == cls)
+                            if mask.sum() == 0:
+                                continue
+                            cls_X  = X_tr_t[mask]
+                            protos = self.net_.centroids[cls]
                             _sub = cls_X
                             if len(cls_X) > 5000:
-                                _idx = torch.randperm(len(cls_X))[:5000]
+                                _idx = torch.randperm(
+                                    len(cls_X), device=device)[:5000]
                                 _sub = cls_X[_idx]
-                            d_proto = torch.cdist(_sub, protos, p=2)    # (B, m)
-                            resp    = torch.softmax(-d_proto, dim=1)    # (B, m)
+                            d_proto = torch.cdist(_sub, protos, p=2)
+                            resp    = torch.softmax(-d_proto, dim=1)
                             for j in range(m):
-                                w    = resp[:, j:j+1]                   # (B, 1)
+                                w     = resp[:, j:j+1]
                                 w_sum = w.sum().clamp(min=1e-10)
-                                wm   = (w * _sub).sum(0) / w_sum        # (F,)
+                                wm    = (w * _sub).sum(0) / w_sum
                                 self.net_.centroids.data[cls, j] = (
                                     self.ema_beta       * protos[j]
                                     + (1.0 - self.ema_beta) * wm)
 
-            # Skip validation on non-val epochs — still count toward patience
+            # Skip validation on non-val epochs
             if (epoch + 1) % val_every != 0 and epoch < self.epochs - 1:
-                # Patience counts epochs, not val events
-                if epoch >= WARMUP and best_state is not None:
-                    wait += 1
                 if self.verbose and (epoch + 1) % 10 == 0:
-                    wa = self.net_._avm_branch_weights().detach().numpy()
-                    print(f"  epoch {epoch+1:3d}  (val skipped)"
-                          f"  AVM[tac:{wa[0]:.2f} bnd:{wa[1]:.2f} cir:{wa[2]:.2f}]")
+                    wa = self.net_._avm_branch_weights().detach().cpu().numpy()
+                    bstr = "  ".join(
+                        f"{BRANCH_DISPLAY[n][:3]}:{w:.2f}"
+                        for n, w in zip(self.net_.active_branches, wa))
+                    print(f"  epoch {epoch+1:3d}  (val skipped)  AVM[{bstr}]")
                 if wait >= self.patience:
                     if self.verbose:
                         print(f"  early stopping at epoch {epoch+1}")
@@ -747,26 +669,24 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
 
             self.net_.eval()
             with torch.no_grad():
-                vp, _, _, vp_tri = self.net_(X_va_t)
-            # Blend triangle into AVM for val scoring — consistent with inference
-            if vp_tri is not None:
-                tw = float(self.tri_weight)
-                vp = (1.0 - tw) * vp + tw * vp_tri
-            vf1 = self._val_score(y_va, vp.numpy().argmax(1))
+                vp, _, _ = self.net_(X_va_t)
+            vf1 = self._val_score(y_va, vp.cpu().numpy().argmax(1))
 
             if vf1 > best_f1:
                 best_f1    = vf1
-                best_state = {k: v.clone() for k, v
+                best_state = {k: v.detach().clone() for k, v
                               in self.net_.state_dict().items()}
                 wait = 0
             else:
                 if epoch >= WARMUP:
-                    wait += 5   # account for skipped epochs
+                    wait += 5
 
             if self.verbose and (epoch + 1) % 10 == 0:
-                wa = self.net_._avm_branch_weights().detach().numpy()
-                print(f"  epoch {epoch+1:3d}  val_f1={vf1:.4f}"
-                      f"  AVM[tac:{wa[0]:.2f} bnd:{wa[1]:.2f} cir:{wa[2]:.2f}]")
+                wa = self.net_._avm_branch_weights().detach().cpu().numpy()
+                bstr = "  ".join(
+                    f"{BRANCH_DISPLAY[n][:3]}:{w:.2f}"
+                    for n, w in zip(self.net_.active_branches, wa))
+                print(f"  epoch {epoch+1:3d}  val_f1={vf1:.4f}  AVM[{bstr}]")
 
             if wait >= self.patience:
                 if self.verbose:
@@ -778,55 +698,62 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         self.best_val_f1_ = best_f1
         self._n_train_    = len(X_tr)
         self._n_val_      = len(X_va)
-        # Store which branches/features were pruned for inspection
+        self.active_branches_ = list(self.net_.active_branches)
 
-        # Extract learned parameters
+        # Extract learned parameters (host-side numpy)
         with torch.no_grad():
-            bw = self.net_._branch_weights().numpy().copy()
-            fw = self.net_._feat_weights().numpy().copy()
-            self.branch_weights_ = bw
-            self.feat_weights_   = fw
-            self.tau_            = torch.exp(self.net_.log_tau).numpy().copy()
+            self.branch_weights_ = self.net_._avm_branch_weights().cpu().numpy().copy()
+            self.feat_weights_   = self.net_._feat_weights().cpu().numpy().copy()
+            self.tau_            = torch.exp(self.net_.log_tau).cpu().numpy().copy()
 
-        # Build split numpy vectors — AVM space and KNN space.
-        # AVM branches: tac[0], bnd[1], cir[2] from _avm_branch_weights()
-        # KNN branches: lin[0], shp[1], sqd[2] from _knn_branch_weights()
-        _fw  = fw.copy()
-        sqfw = np.sqrt(_fw).astype(np.float32)
+        # ── Post-fit numpy combined-vector builders ──────────────────────────
+        # All inference paths run on numpy (CPU) — FAISS and Mahalanobis live
+        # there. Extract the learned scaling factors once.
+        sqfw   = np.sqrt(self.feat_weights_).astype(np.float32)
+        wa     = self.branch_weights_
+        active = self.active_branches_
+        use_dual = self.use_dual_boundary
 
-        wa = self.net_._avm_branch_weights().detach().numpy()
-        sa_tac = np.float32(np.sqrt(wa[0]))
-        sa_b   = np.float32(np.sqrt(wa[1]))
-        sa_cir = np.float32(np.sqrt(wa[2]))
-        wk     = self.net_._knn_branch_weights().detach().numpy()
-        sk_lin = np.float32(np.sqrt(wk[0]))
-        sk_s   = np.float32(np.sqrt(wk[1]))
-        sk_sq  = np.float32(np.sqrt(wk[2]))
-
-        def _make_avm_combined(xn, batch_size=10_000):
-            """AVM space: tac + boundary + circular (3F or 4F with dual)."""
-            def _chunk(chunk):
-                eps     = 1e-7
-                a       = np.arccos(np.clip(chunk, -1+eps, 1-eps))
-                tac     = np.tanh(a * 0.8) * sqfw
+        def _np_branch_feature(name, chunk, sqfw_local):
+            eps = 1e-7
+            if name == 'tac':
+                a = np.arccos(np.clip(chunk, -1+eps, 1-eps))
+                return np.tanh(a * 0.8) * sqfw_local
+            if name == 'b':
                 norm_sq = (chunk**2).sum(1, keepdims=True)
-                if self.use_dual_boundary:
+                if use_dual:
                     bnd_p = norm_sq - 2.0*chunk + 1.0
                     bnd_n = norm_sq + 2.0*chunk + 1.0
-                    bnd   = np.sqrt(np.concatenate([bnd_p, bnd_n], axis=1).clip(min=eps))
-                else:
-                    bnd   = np.sqrt((norm_sq - 2.0*chunk + 1.0).clip(min=eps))
-                cir     = np.sqrt(np.clip(1.0-chunk*chunk, eps, None)) * sqfw
-                return np.concatenate([
-                    sa_tac*tac, sa_b*bnd, sa_cir*cir
-                ], axis=1).astype(np.float32)
+                    stacked = np.stack([bnd_p, bnd_n], axis=2)
+                    return np.sqrt(
+                        stacked.reshape(stacked.shape[0], -1).clip(min=eps))
+                return np.sqrt((norm_sq - 2.0*chunk + 1.0).clip(min=eps))
+            if name == 'cir':
+                return np.sqrt(
+                    np.clip(1.0 - chunk*chunk, eps, None)) * sqfw_local
+            if name == 'sq':
+                return (chunk * chunk) * sqfw_local
+            if name == 'mtac':
+                a = np.arccos(np.clip(-chunk, -1+eps, 1-eps))
+                return np.tanh(a * 0.8) * sqfw_local
+            raise ValueError(f"unknown branch: {name}")
+
+        gate_sqrt = [np.float32(np.sqrt(w)) for w in wa]
+
+        def _make_avm_combined(xn, batch_size=10_000):
+            def _chunk(chunk):
+                parts = [
+                    gate_sqrt[i] * _np_branch_feature(name, chunk, sqfw)
+                    for i, name in enumerate(active)
+                ]
+                return np.concatenate(parts, axis=1).astype(np.float32)
             if len(xn) <= batch_size:
                 return _chunk(xn)
             return np.vstack([_chunk(xn[i:i+batch_size])
                                for i in range(0, len(xn), batch_size)])
 
         def _make_knn_combined(xn, batch_size=10_000):
-            """KNN space: linear + shape + quadratic (3F)."""
+            """KNN space: linear + shape + quadratic (3F), uniform branches."""
             def _chunk(chunk):
                 eps = 1e-7
                 lin = chunk * sqfw
@@ -834,9 +761,8 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                 sd  = chunk.std(1, keepdims=True).clip(min=eps)
                 shp = (chunk - mu) / sd
                 sqd = chunk * chunk * sqfw
-                return np.concatenate([
-                    sk_lin*lin, sk_s*shp, sk_sq*sqd
-                ], axis=1).astype(np.float32)
+                return np.concatenate([lin, shp, sqd],
+                                      axis=1).astype(np.float32)
             if len(xn) <= batch_size:
                 return _chunk(xn)
             return np.vstack([_chunk(xn[i:i+batch_size])
@@ -844,34 +770,18 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
 
         self._make_avm_combined = _make_avm_combined
         self._make_knn_combined = _make_knn_combined
-        self._make_combined     = _make_avm_combined
 
-        # Extract learned prototype positions in combined space
-        # centroids: (K, m, F) → flatten to (K*m, F) for _make_combined
-        raw_c_n     = self.net_.centroids.detach().numpy()     # (K, m, F)
-        init_c_n    = self.net_.centroid_anchor.numpy()        # (K, m, F)
+        # Extract learned prototype positions in AVM combined space
+        raw_c_n     = self.net_.centroids.detach().cpu().numpy()
+        init_c_n    = self.net_.centroid_anchor.cpu().numpy()
         raw_c_flat  = raw_c_n.reshape(K * m, n_feat)
         self.centroids_combined_ = _make_avm_combined(
-            raw_c_flat).astype(np.float32)                     # (K*m, 3F)
-        self.n_prototypes_ = m   # actual m used (post-fit)
-
-        # Triangle inference data
-        if self.use_triangle and hasattr(self.net_, 'log_w_pairs'):
-            import torch as _torch
-            F = n_feat
-            self._tri_pairs_     = np.array(
-                [(a,b) for a in range(F) for b in range(a+1,F)],
-                dtype=np.int32)
-            self._tri_w_np_      = _torch.nn.functional.softplus(
-                self.net_.log_w_pairs).detach().numpy().astype(np.float32)
-            self._tau_tri_       = float(
-                _torch.exp(self.net_.log_tau_tri).detach())
-            self._tri_centroids_ = raw_c_flat.copy()  # (K*m, F)
+            raw_c_flat).astype(np.float32)
+        self.n_prototypes_ = m
 
         # Drift: mean distance each prototype moved from its anchor
-        drift_flat = np.sqrt(
-            ((raw_c_n - init_c_n) ** 2).sum(-1))              # (K, m)
-        self.centroid_drift_ = drift_flat.mean(1)              # (K,) mean over protos
+        drift_flat = np.sqrt(((raw_c_n - init_c_n) ** 2).sum(-1))
+        self.centroid_drift_ = drift_flat.mean(1)
 
         counts_tr = np.array([(y_tr == i).sum() for i in range(K)],
                               dtype=np.int32)
@@ -883,34 +793,11 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                 print(f"  centroid cls{self.classes_[i]}: "
                       f"n={int(counts_tr[i])}  drift=[{proto_drifts}]")
 
-        # Regularised full Mahalanobis covariance in combined space
-        #
-        # Diagonal Mahalanobis rescales each dimension independently —
-        # equivalent to an axis-aligned ellipsoid. It cannot represent
-        # correlated features (e.g. high-quality wine = high alcohol AND
-        # low volatile acidity jointly). Full covariance captures rotation:
-        # the decision boundary can align with the actual cluster orientation.
-        #
-        # Estimation strategy: Regularised Discriminant Analysis (RDA)
-        #   Σ_k = (1-α)*S_k + α*S_pooled
-        #
-        #   α → 0: full per-class QDA (may be ill-conditioned for small n_k)
-        #   α → 1: shared pooled covariance (LDA)
-        #   α = 0.5: balanced blend (default)
-        #
-        # Then ridge regularise the blend:
-        #   Σ_k_reg = (1-r)*Σ_k + r*I * mean(diag(Σ_k))
-        #
-        # This ensures positive-definiteness even when n_k < dim.
-        # Cholesky decomposition used for numerically stable inversion.
-        # Build training combined vectors once — reused for both
-        # Mahalanobis covariance estimation and FAISS index construction.
-
+        # Mahalanobis RDA covariance — see comments below for math
         if self.mahalanobis:
-            X_tr_c = _make_avm_combined(X_tr_n)   # AVM space for Mahal
+            X_tr_c = _make_avm_combined(X_tr_n)
             D      = X_tr_c.shape[1]
 
-            # Pooled covariance — weighted sum of per-class covariances
             S_pooled = np.zeros((D, D), dtype=np.float64)
             for i in range(K):
                 cls_pts = X_tr_c[y_tr == i].astype(np.float64)
@@ -918,49 +805,61 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                     continue
                 c = cls_pts - cls_pts.mean(0, keepdims=True)
                 S_pooled += (c.T @ c)
-            S_pooled /= (len(X_tr_c) - K)   # unbiased pooled estimate
+            S_pooled /= (len(X_tr_c) - K)
 
-            self.cov_inv_  = np.zeros((K, D, D), dtype=np.float32)
+            self.cov_inv_  = np.zeros((K * m, D, D), dtype=np.float32)
             alpha          = float(self.mahal_alpha)
             ridge          = float(self.mahal_reg)
 
+            # Build per-prototype soft assignments in normalised space.
+            # CPU tensor — the soft-assignment math is tiny (~K*n_k*m) and
+            # not worth the device round-trip for this one-shot computation.
+            X_tr_n_t = torch.tensor(X_tr_n, dtype=torch.float32)
+
             for i in range(K):
-                cls_pts = X_tr_c[y_tr == i].astype(np.float64)
-                n_k     = len(cls_pts)
+                cls_mask = (y_tr == i)
+                cls_pts  = X_tr_c[cls_mask].astype(np.float64)
+                n_k      = len(cls_pts)
 
                 if n_k < 2:
-                    # Only 1 sample — use pooled covariance entirely
-                    S_k = S_pooled.copy()
-                else:
+                    for j in range(m):
+                        self.cov_inv_[i * m + j] = self._invert_cov(
+                            S_pooled, ridge, D)
+                    continue
+
+                if m == 1:
                     c   = cls_pts - cls_pts.mean(0, keepdims=True)
                     S_k = (c.T @ c) / (n_k - 1)
+                    S_blend = (1.0 - alpha) * S_k + alpha * S_pooled
+                    self.cov_inv_[i] = self._invert_cov(S_blend, ridge, D)
+                else:
+                    cls_pts_raw = X_tr_n_t[torch.tensor(cls_mask)]
+                    protos_raw  = torch.tensor(raw_c_n[i],
+                                                dtype=torch.float32)
+                    d_proto = torch.cdist(cls_pts_raw, protos_raw, p=2)
+                    resp    = torch.softmax(-d_proto, dim=1).numpy()
 
-                # RDA blend: mix per-class and pooled
-                S_blend = (1.0 - alpha) * S_k + alpha * S_pooled
-
-                # Ridge regularisation toward scaled identity
-                # Prevents ill-conditioning when n_k < D
-                scale          = np.diag(S_blend).mean().clip(min=1e-10)
-                S_reg          = ((1.0 - ridge) * S_blend
-                                  + ridge * scale * np.eye(D))
-
-                # Cholesky inversion — numerically stable for PD matrices
-                try:
-                    L     = np.linalg.cholesky(S_reg)
-                    L_inv = np.linalg.solve(L, np.eye(D))
-                    self.cov_inv_[i] = (L_inv.T @ L_inv).astype(np.float32)
-                except np.linalg.LinAlgError:
-                    # Fallback: pseudo-inverse if Cholesky fails
-                    self.cov_inv_[i] = np.linalg.pinv(
-                        S_reg).astype(np.float32)
+                    for j in range(m):
+                        w     = resp[:, j].astype(np.float64)
+                        w_sum = max(w.sum(), 1e-10)
+                        mu_j  = (w[:, None] * cls_pts).sum(0) / w_sum
+                        c     = cls_pts - mu_j
+                        S_j   = (w[:, None] * c).T @ c / w_sum
+                        ess   = (w.sum() ** 2) / (w ** 2).sum().clip(min=1e-10)
+                        if ess > 1:
+                            S_j *= ess / (ess - 1)
+                        S_blend = (1.0 - alpha) * S_j + alpha * S_pooled
+                        self.cov_inv_[i * m + j] = self._invert_cov(
+                            S_blend, ridge, D)
 
             if self.verbose:
-                print(f"  Mahalanobis: full RDA "
-                      f"(alpha={alpha:.2f} ridge={ridge:.0e} D={D})")
+                print(f"  Mahalanobis: per-prototype RDA "
+                      f"(alpha={alpha:.2f} ridge={ridge:.0e} "
+                      f"D={D} K*m={K*m})")
         else:
             self.cov_inv_ = None
 
-        # FAISS index — reuses X_tr_c_post computed above
+        # FAISS index
         self.lambda_ = self.lam_floor
         if not _HAS_FAISS:
             if self.verbose:
@@ -968,7 +867,7 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             self.lambda_ = 1.0
             self.index_  = None
         else:
-            X_tr_c  = _make_knn_combined(X_tr_n)  # KNN space for FAISS
+            X_tr_c  = _make_knn_combined(X_tr_n)
             dim     = X_tr_c.shape[1]
             N_build = X_tr_c.shape[0]
             built  = False
@@ -996,58 +895,39 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             index.add(X_tr_c)
             self.index_           = index
             self.train_class_idx_ = y_tr.copy()
-            # Store raw normalised training vectors for triangle
-            # local scoring — shape (N_tr, F)
-            if self.use_triangle:
-                self._train_Xn_ = X_tr_n.copy()
 
-            # Lambda selection — three modes
             if self.entropy_lambda:
-                # AVM confidence gate — no training needed.
-                # lambda(x) = lam_confident - (lam_confident - lam_uncertain) * H(x)
-                # where H(x) = normalised entropy of AVM probability vector.
-                # High AVM entropy (uncertain) → low lambda (trust KNN more).
-                # Low AVM entropy (confident)  → high lambda (trust AVM more).
-                self.lambda_ = None   # signals entropy gate in predict_proba
+                self.lambda_ = None
                 if self.verbose:
                     print(f"  lambda mode=entropy  "
                           f"confident={self.lam_confident}  "
                           f"uncertain={self.lam_uncertain}")
-
             else:
-                # Lambda selection: compare scalar search vs confidence gate.
-                # Triangle blended into AVM first — consistent with training
-                # and val scoring. Gate selects between AVM(+tri) vs KNN.
                 X_va_avm = _make_avm_combined(X_va_n)
                 avm_val  = self._avm_proba(X_va_avm)
-
-                # Blend triangle into AVM for lambda search
-                if self.use_triangle and hasattr(self, '_tri_pairs_'):
-                    tri_val = self._tri_proba(X_va_n)
-                    if tri_val is not None:
-                        tw      = float(self.tri_weight)
-                        avm_val = (1.0 - tw) * avm_val + tw * tri_val
 
                 X_va_knn = _make_knn_combined(X_va_n)
                 knn_val  = self._knn_proba(X_va_knn)
 
-                # Option A — scalar grid search
+                # Scalar grid search
+                n_steps     = int(round((1.0 - self.lam_floor) / 0.05)) + 1
+                lam_grid    = np.linspace(self.lam_floor, 1.0, n_steps)
                 best_lam_f1, best_lam = -1.0, self.lam_floor
-                for lam_c in np.arange(self.lam_floor, 1.01, 0.05):
-                    lam_c = float(np.round(lam_c, 6))
+                for lam_c in lam_grid:
+                    lam_c = float(lam_c)
                     p  = lam_c * avm_val + (1.0 - lam_c) * knn_val
                     f1 = self._val_score(y_va, p.argmax(1))
                     if f1 > best_lam_f1:
                         best_lam_f1 = f1
                         best_lam    = lam_c
 
-                # Option B — confidence-weighted gate (AVM+tri vs KNN)
+                # Confidence-weighted gate
                 lam_conf, _ = self._lambda_gate(avm_val, knn_val)
                 p_conf      = lam_conf[:,None]*avm_val + (1-lam_conf[:,None])*knn_val
-                conf_f1 = self._val_score(y_va, p_conf.argmax(1))
+                conf_f1     = self._val_score(y_va, p_conf.argmax(1))
 
                 if conf_f1 >= best_lam_f1:
-                    self.lambda_ = None   # None = use confidence gate
+                    self.lambda_ = None
                     if self.verbose:
                         print(f"  lambda: confidence gate  val_f1={conf_f1:.4f}"
                               f" (scalar={best_lam_f1:.4f})")
@@ -1058,31 +938,39 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                               f"  val_f1={best_lam_f1:.4f}"
                               f" (conf={conf_f1:.4f})")
 
-
         return self
 
-    # ── inference ─────────────────────────────────────────────────────────────
+    # ── inference helpers ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _invert_cov(S, ridge, D):
+        """Ridge-regularise and Cholesky-invert a covariance matrix.
+        Falls back to pseudo-inverse on numerical failure."""
+        scale = np.diag(S).mean().clip(min=1e-10)
+        S_reg = (1.0 - ridge) * S + ridge * scale * np.eye(D)
+        try:
+            L     = np.linalg.cholesky(S_reg)
+            L_inv = np.linalg.solve(L, np.eye(D))
+            return (L_inv.T @ L_inv).astype(np.float32)
+        except np.linalg.LinAlgError:
+            return np.linalg.pinv(S_reg).astype(np.float32)
 
     def _avm_proba(self, combined):
         """
         Multi-prototype AVM scoring.
-        centroids_combined_ shape: (K*m, D)
         Aggregates inverse-distances per class by summing over prototypes.
+        Per-prototype Mahalanobis when n_prototypes>1.
         """
-        K   = len(self.classes_)
-        m   = self.n_prototypes_
-        N   = combined.shape[0]
+        K = len(self.classes_)
+        m = self.n_prototypes_
+        N = combined.shape[0]
 
         if self.cov_inv_ is not None:
-            # Full Mahalanobis — one cov_inv per class applied to each proto.
-            # Use float64 intermediates — float32 overflows on high-dimensional
-            # combined vectors (digits: 384-dim × large covariance values).
             d_flat = np.zeros((N, K * m), dtype=np.float64)
             comb64 = combined.astype(np.float64)
             for km in range(K * m):
-                k    = km // m
                 diff = comb64 - self.centroids_combined_[km].astype(np.float64)
-                tmp  = diff @ self.cov_inv_[k].astype(np.float64)
+                tmp  = diff @ self.cov_inv_[km].astype(np.float64)
                 d_flat[:, km] = np.sqrt(
                     np.maximum((tmp * diff).sum(1), 0.0))
             d_flat = d_flat.astype(np.float32)
@@ -1092,30 +980,23 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             ab     = combined @ self.centroids_combined_.T
             d_flat = np.sqrt(np.maximum(
                 a_sq + b_sq[None, :] - 2.0 * ab, 0.0)).astype(np.float32)
-            # d_flat: (N, K*m)
 
-        # Aggregate: sum 1/(d+eps) per class over its m prototypes
-        d_km  = d_flat.reshape(N, K, m)              # (N, K, m)
-        raw   = (1.0 / (d_km + 1e-10)).sum(2)        # (N, K)
+        d_km = d_flat.reshape(N, K, m)
+        raw  = (1.0 / (d_km + 1e-10)).sum(2)
         return raw / raw.sum(1, keepdims=True)
 
     def _knn_proba(self, combined, search_batch=50_000):
-        """
-        KNN inverse-distance vote.
-        Vectorized scatter — avoids np.add.at overhead.
-        Loop over k neighbours (k=5..10) is cheap; avoids O(N*k) Python calls.
-        """
         if self.index_ is None:
             raise RuntimeError("FAISS index not built.")
         n_test = combined.shape[0]
         K      = len(self.classes_)
         proba  = np.zeros((n_test, K), dtype=np.float32)
         for start in range(0, n_test, search_batch):
-            end    = min(start + search_batch, n_test)
+            end       = min(start + search_batch, n_test)
             dist, idx = self.index_.search(combined[start:end], self.k)
             w = 1.0 / (dist + 1e-10)
-            w = w / w.sum(1, keepdims=True)                  # (B, k)
-            labels = self.train_class_idx_[idx]               # (B, k)
+            w = w / w.sum(1, keepdims=True)
+            labels = self.train_class_idx_[idx]
             B = end - start
             batch_p = np.zeros((B, K), dtype=np.float32)
             for ki in range(self.k):
@@ -1124,10 +1005,7 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         return proba
 
     def _lambda_gate(self, avm, knn):
-        """
-        Confidence-weighted gate: AVM vs KNN.
-        lambda = conf_AVM / (conf_AVM + conf_KNN).
-        """
+        """Confidence-weighted gate: lambda = conf_AVM / (conf_AVM + conf_KNN)."""
         K     = len(self.classes_)
         log_K = np.log(K + 1e-10)
         H_avm = -(avm * np.log(avm.clip(1e-10))).sum(1) / log_K
@@ -1140,44 +1018,10 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         disagree = c_avm * c_knn * (1 - overlap)
         return lam, disagree
 
-
-    def _tri_proba(self, Xn):
-        """
-        Triangle probability vector — numpy inference path.
-        Mirrors the training forward() triangle blend.
-        Only active when use_triangle=True and triangle data was stored.
-        """
-        if not self.use_triangle or getattr(self, '_tri_pairs_', None) is None:
-            return None
-        N, K, m = Xn.shape[0], len(self.classes_), self.n_prototypes_
-        eps = 1e-7
-        pa  = self._tri_pairs_[:, 0]
-        pb  = self._tri_pairs_[:, 1]
-        w   = self._tri_w_np_
-
-        x_dev  = Xn                   - Xn.mean(1, keepdims=True)
-        mu_dev = self._tri_centroids_ - self._tri_centroids_.mean(1, keepdims=True)
-
-        xa = x_dev[:, pa];  xb = x_dev[:, pb]    # (N, P)
-        ma = mu_dev[:, pa]; mb = mu_dev[:, pb]    # (K*m, P)
-
-        cross  = xa[:, None, :] * mb[None, :, :] - xb[:, None, :] * ma[None, :, :]
-        t_flat = np.sqrt((w * cross**2).sum(-1) + eps)           # (N, K*m)
-        raw    = (1.0 / (t_flat.reshape(N, K, m) + eps)).sum(2)  # (N, K)
-        return (raw / raw.sum(1, keepdims=True).clip(min=eps)).astype(np.float32)
-
-    def _blend_avm_tri(self, avm, Xn):
-        """Blend triangle into AVM — consistent with training forward pass."""
-        tri = self._tri_proba(Xn)
-        if tri is None:
-            return avm
-        tw = float(self.tri_weight)
-        return (1.0 - tw) * avm + tw * tri
-
     def predict_proba(self, X):
         check_is_fitted(self, 'centroids_combined_')
-        X        = np.asarray(X, dtype=np.float32)
-        Xn       = self._norm_apply(X)
+        X      = np.asarray(X, dtype=np.float32)
+        Xn     = self._norm_apply(X)
         Xn_avm = self._make_avm_combined(Xn)
         avm    = self._avm_proba(Xn_avm)
 
@@ -1185,7 +1029,7 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                 self.lambda_ is not None and self.lambda_ >= 1.0):
             return avm
 
-        knn = self._knn_proba(self._make_knn_combined(Xn))  # KNN space
+        knn = self._knn_proba(self._make_knn_combined(Xn))
 
         if self.entropy_lambda:
             K   = len(self.classes_)
@@ -1208,12 +1052,11 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
     def predict_with_uncertainty(self, X):
         """
         Returns (predictions, proba, disagreement_scores).
-        Triangle is blended into AVM — gate is AVM(+tri) vs local neighbours.
-        Disagreement: both confident but predicting different classes.
+        Gate weights AVM vs KNN by per-sample confidence.
         """
         check_is_fitted(self, 'centroids_combined_')
-        X        = np.asarray(X, dtype=np.float32)
-        Xn       = self._norm_apply(X)
+        X      = np.asarray(X, dtype=np.float32)
+        Xn     = self._norm_apply(X)
         Xn_avm = self._make_avm_combined(Xn)
         avm    = self._avm_proba(Xn_avm)
 
@@ -1227,14 +1070,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         return self.classes_[proba.argmax(1)], proba, disagree
 
     def class_distribution(self, as_dict=False):
-        """
-        Training class distribution as percentages.
-        Parameters
-        ----------
-        as_dict : bool
-            If True return {class_label: pct}. If False return a
-            formatted string like "0: 4%  1: 82%  2: 14%".
-        """
         check_is_fitted(self, 'classes_')
         counts = getattr(self, '_class_counts_', None)
         if counts is None:
@@ -1253,6 +1088,7 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         names = (list(feature_names) if feature_names is not None
                  else [f"f{i}" for i in range(len(self.feat_weights_))])
         bw  = self.branch_weights_
+        ab  = self.active_branches_
         lam = getattr(self, 'lambda_', self.lam_floor)
         tau = self.tau_
         tau_str = (f"{float(tau):.3f}" if np.ndim(tau) == 0 or np.size(tau) == 1
@@ -1260,13 +1096,15 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         lam_str = ("[confidence gate]" if lam is None else
                    "[entropy gate]"    if self.entropy_lambda else
                    f"{lam:.3f}")
-        K    = len(self.classes_)
-        n_tr = getattr(self, '_n_train_', '?')
-        n_va = getattr(self, '_n_val_',   '?')
-        dist = self.class_distribution()
+        K     = len(self.classes_)
+        n_tr  = getattr(self, '_n_train_', '?')
+        n_va  = getattr(self, '_n_val_',   '?')
+        dev   = getattr(self, 'device_', '?')
+        dist  = self.class_distribution()
         lines = [
             f"  Classes ({K}): {dist}",
             f"  Train / val  : {n_tr} / {n_va}",
+            f"  Device       : {dev}",
             "",
             f"  Lambda  : {lam_str}",
             f"  Tau     : {tau_str}",
@@ -1278,20 +1116,20 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             f"  SupCon      : {self.supcon}"
             f"  (weight={self.supcon_weight}  temp={self.supcon_temp})",
             f"  EMA         : {self.ema_centroids}  (beta={self.ema_beta})",
-            f"  Triangle    : {self.use_triangle}  (weight={self.tri_weight})",
             f"  Dual bnd    : {self.use_dual_boundary}",
+            f"  Branch set  : {self.branch_set}  ({len(ab)} branches)",
             f"  n_prototypes: {getattr(self, 'n_prototypes_', self.n_prototypes)}"
             f"  per_class_τ: {self.per_class_tau}",
             f"  ortho_reg   : {self.ortho_reg}",
             "",
-            f"  AVM branches (global view):",
-            f"    tanh_arccos : {bw[0]:.4f}",
-            f"    boundary    : {bw[1]:.4f}",
-            f"    circular    : {bw[2]:.4f}",
-            f"  KNN branches (frozen local view):",
-            f"    linear      : {bw[3]:.4f}",
-            f"    shape       : {bw[4]:.4f}",
-            f"    quadratic   : {bw[5]:.4f}",
+            f"  AVM branches (learned):",
+        ]
+        order = np.argsort(bw)[::-1]
+        for i in order:
+            lines.append(
+                f"    {BRANCH_DISPLAY[ab[i]]:<12}: {bw[i]:.4f}")
+        lines += [
+            f"  KNN voter   : fixed-feature FAISS index (no learned weights)",
             "",
             f"  Feature weights (top 5):",
         ]
