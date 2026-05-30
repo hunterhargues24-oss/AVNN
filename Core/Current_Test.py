@@ -140,7 +140,7 @@ def main():
         branch_set='extended',
         device='auto',
         random_state=42,
-        verbose=False,
+        verbose=False
     )
 
     # Balanced datasets: minimal config, n_prototypes=1, no imbalance handling
@@ -155,11 +155,14 @@ def main():
     # stopping, higher weight cap
     imbalanced_config = dict(base_config)
     imbalanced_config.update(
-        n_prototypes=2,
+        n_prototypes=1,
         ema_centroids=True,
-        weight_cap=4.0,
+        entropy_lambda=False,
+        weight_cap=6.0,
         val_macro_bias=0.85,
-        ordinal=False,   # Wine quality IS ordinal, but ordinal=True hasn't
+        supcon=False,
+        ordinal=False, 
+        mahalanobis=True # Wine quality IS ordinal, but ordinal=True hasn't
                           # helped in practice on these — keep it off for now
     )
 
@@ -178,7 +181,8 @@ def main():
 
     benchmark("Breast Cancer", bc.data, bc.target,
               feature_names=bc.feature_names,
-              config=balanced_config)
+              config=imbalanced_config,
+              show_per_class=True)
 
     # Wine quality (downloaded / cached)
     try:
