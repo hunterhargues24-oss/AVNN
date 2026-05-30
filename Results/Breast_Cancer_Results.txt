@@ -1,0 +1,51 @@
+============================================================
+Breast Cancer  (569 samples, 30 features, 2 classes)
+============================================================
+  class distribution:
+    0: 212  (37.3%)
+    1: 357  (62.7%)
+
+  Accuracy    : 0.9402 ± 0.0117
+  Macro F1    : 0.9360 ± 0.0119
+  Weighted F1 : 0.9402 ± 0.0114
+  Total time  : 7.0s  (1.4s per fold)
+
+Model summary (last fold):
+  Classes (2): 0: 37%  1: 63%
+  Train / val  : 389 / 67
+  Device       : cuda
+
+  Lambda  : [confidence gate]
+  Tau     : cls0:0.638  cls1:0.577
+  Val F1  : 0.8483
+
+  Mahalanobis : full RDA  (alpha=0.5  ridge=1e-06)
+  Ordinal EMD : False  (weight=0.5)
+  SupCon      : False  (weight=0.3  temp=0.1)
+  EMA         : False  (beta=0.9)
+  Dual bnd    : False
+  Branch set  : extended  (5 branches)
+  n_prototypes: 1  per_class_τ: True
+  ortho_reg   : 0.01
+
+  AVM branches (learned):
+    boundary    : 0.2353
+    tanh_arccos : 0.2262
+    mirror_tac  : 0.1810
+    squared     : 0.1788
+    circular    : 0.1787
+  KNN voter   : fixed-feature FAISS index (no learned weights)
+
+  Feature weights (top 5):
+    worst area                   1.0667
+    mean area                    1.0664
+    area error                   1.0663
+    mean perimeter               1.0658
+    mean concave points          1.0651
+  Feature weights (bottom 2):
+    worst fractal dimension      0.9443
+    texture error                0.9448
+
+  Centroid drift:
+    class 0: 0.2619  ██████████
+    class 1: 0.2945  ███████████
