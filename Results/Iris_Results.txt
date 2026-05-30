@@ -1,0 +1,52 @@
+============================================================
+Iris  (150 samples, 4 features, 3 classes)
+============================================================
+  class distribution:
+    0: 50  (33.3%)
+    1: 50  (33.3%)
+    2: 50  (33.3%)
+
+  Accuracy    : 0.9533 ± 0.0163
+  Macro F1    : 0.9531 ± 0.0165
+  Weighted F1 : 0.9531 ± 0.0165
+  Total time  : 6.9s  (1.4s per fold)
+
+Model summary (last fold):
+  Classes (3): 0: 33%  1: 33%  2: 33%
+  Train / val  : 102 / 18
+  Device       : cuda
+
+  Lambda  : [confidence gate]
+  Tau     : cls0:0.614  cls1:0.600  cls2:0.614
+  Val F1  : 0.9442
+
+  Mahalanobis : full RDA  (alpha=0.5  ridge=1e-06)
+  Ordinal EMD : False  (weight=0.5)
+  SupCon      : False  (weight=0.3  temp=0.1)
+  EMA         : False  (beta=0.9)
+  Dual bnd    : False
+  Branch set  : extended  (5 branches)
+  n_prototypes: 1  per_class_τ: True
+  ortho_reg   : 0.01
+
+  AVM branches (learned):
+    tanh_arccos : 0.2276
+    boundary    : 0.2276
+    mirror_tac  : 0.1830
+    squared     : 0.1809
+    circular    : 0.1809
+  KNN voter   : fixed-feature FAISS index (no learned weights)
+
+  Feature weights (top 5):
+    petal width (cm)             1.0117
+    petal length (cm)            1.0117
+    sepal width (cm)             0.9883
+    sepal length (cm)            0.9883
+  Feature weights (bottom 2):
+    sepal length (cm)            0.9883
+    sepal width (cm)             0.9883
+
+  Centroid drift:
+    class 0: 0.0227  
+    class 1: 0.0227  
+    class 2: 0.0227  
