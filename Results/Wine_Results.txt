@@ -1,0 +1,55 @@
+============================================================
+Wine  (178 samples, 13 features, 3 classes)
+============================================================
+  class distribution:
+    0: 59  (33.1%)
+    1: 71  (39.9%)
+    2: 48  (27.0%)
+
+  Accuracy    : 0.9832 ± 0.0223
+  Macro F1    : 0.9831 ± 0.0222
+  Weighted F1 : 0.9830 ± 0.0226
+  Total time  : 7.8s  (1.6s per fold)
+
+Model summary (last fold):
+  Classes (3): 0: 33%  1: 39%  2: 28%
+  Train / val  : 123 / 20
+  Device       : cuda
+
+  Lambda  : 0.600
+  Tau     : cls0:0.644  cls1:0.593  cls2:0.569
+  Val F1  : 0.9489
+
+  Mahalanobis : full RDA  (alpha=0.5  ridge=1e-06)
+  Ordinal EMD : False  (weight=0.5)
+  SupCon      : False  (weight=0.3  temp=0.1)
+  EMA         : False  (beta=0.9)
+  Dual bnd    : False
+  Branch set  : extended  (5 branches)
+  n_prototypes: 1  per_class_τ: True
+  ortho_reg   : 0.01
+
+  AVM branches (learned):
+    boundary    : 0.2290
+    tanh_arccos : 0.2249
+    mirror_tac  : 0.1924
+    squared     : 0.1802
+    circular    : 0.1735
+  KNN voter   : fixed-feature FAISS index (no learned weights)
+
+  Feature weights (top 5):
+    color_intensity              1.1359
+    flavanoids                   1.1357
+    od280/od315_of_diluted_wines 1.1118
+    proline                      1.0954
+    alcalinity_of_ash            1.0488
+  Feature weights (bottom 2):
+    nonflavanoid_phenols         0.9242
+    total_phenols                0.9246
+
+  Centroid drift:
+    class 0: 0.1862  ███████
+    class 1: 0.3701  ██████████████
+    class 2: 0.3255  █████████████
+
+  Lambda search: floor=0.5  chosen=0.600
