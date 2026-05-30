@@ -2,7 +2,7 @@
 LearningAVNN
 ============
 Geometric tabular classifier combining a trained Angular Vector Machine
-(AVM) with a FAISS-accelerated KNN voter, blended at inference.
+(AVM) with a per-class FAISS-accelerated KNN voter, blended at inference.
 
 Architecture
 ------------
@@ -11,14 +11,18 @@ Architecture
             → Mahalanobis inverse-distance to K×m learnable prototypes
               → AVM probability  (trained end-to-end)
        → KNN: linear + shape + quadratic combined vector
-            → FAISS inverse-distance vote over k nearest training points
-              → KNN probability  (fixed features, post-fit)
-       → predict: λ·AVM + (1-λ)·KNN   (λ tuned on val, or per-sample
-                                       confidence gate)
+            → K separate FAISS indices, one per class
+            → per-class inverse-distance score + novelty signal
+              → KNN probability + novelty (fixed features, post-fit)
+       → predict: λ·AVM + (1-λ)·KNN
+                  λ uses confidence gate (AVM entropy + KNN entropy +
+                  KNN novelty) to weight per-sample, or scalar tuned on val.
 
-This is late-fusion. The AVM trains end-to-end. The KNN voter is built
-from the same training data using a fixed geometric view once training
-completes, then blended at inference.
+The KNN voter is class-conditional: each test point queries every class's
+own index for its k nearest in-class neighbors. This prevents the
+majority class from drowning out minorities in the nearest-neighbor pool,
+and provides a natural anomaly signal — a test point that's far from
+every class's manifold is likely novel.
 
 AVM Branch Sets  (learned — global structure / centroid proximity)
 ------------------------------------------------------------------
@@ -33,34 +37,49 @@ AVM Branch Sets  (learned — global structure / centroid proximity)
     bnd     √(‖x‖²-2x+1)                cross-feature coupling via ‖x‖²;
                                         optional dual extends to 2F
     cir     √(1-x²)                     symmetric, peaks at x=0
-    sq      x²                          symmetric, peaks at x=±1 (opposite
-                                        curvature from cir)
-    mtac    tanh(arccos(-x)·0.8)        mirror of tac — monotone INCREASING,
-                                        captures positive-direction signal
+    sq      x²                          symmetric, peaks at x=±1
+    mtac    tanh(arccos(-x)·0.8)        mirror of tac — monotone INCREASING
+
+KNN Voter  (fixed — local structure / per-class neighbourhood similarity)
+-------------------------------------------------------------------------
+  linear       x·√fw           signed magnitude, direct local proximity
+  shape        (x-μ)/σ         within-sample relative profile fingerprint
+  quadratic    x²·√fw          nonlinear extremeness
+
+  Per-class indices: for each class k, build a FAISS index over the
+  class-k training points. At inference, search each class's index
+  separately for k nearest in-class neighbours. The class-k score is
+  the mean inverse-distance of those neighbours; per-class scores are
+  normalised into a probability distribution.
+
+  Novelty signal: the linear-L2 distance from the test point to its
+  nearest neighbour in any class, normalised by a per-class typical
+  intra-class distance computed during fit. Novelty ≈ 1 means the test
+  point is at a typical training distance; novelty >> 1 means the point
+  is far from every class manifold and the KNN view should be distrusted.
 
 Performance
 -----------
   device='auto'      Picks 'cuda' if available, else 'cpu'.
-  Mixed precision    Automatic on CUDA via torch.amp.autocast — roughly 2×
-                     forward/backward throughput on modern GPUs.
+  Mixed precision    Automatic on CUDA via torch.amp.autocast.
   Index-on-demand    Shuffle indices once per epoch, slice X_tr_t inside
                      the batch loop. No full-tensor copy per epoch.
-  Cached class means EMA path with m=1 reuses class means computed once
-                     before training (they don't change).
+  Cached class means EMA path with m=1 reuses class means computed once.
 
 Imbalance Handling
 ------------------
   SupCon loss     — pulls same-class AVM embeddings together per batch
   Per-class tau   — each class learns its own scoring sharpness
-  Mahalanobis RDA — full per-class covariance at inference (α-blended QDA/LDA)
+  Mahalanobis RDA — full per-class covariance at inference (α-blended)
   Class weights   — balanced NLL capped at weight_cap
   Ordinal EMD     — Earth Mover's Distance for ordered class structures
   EMA centroids   — exponential moving average stabilises minority prototypes
   val_macro_bias  — early stopping biased toward macro F1 over accuracy
+  Class-cond KNN  — each class gets its own neighbour pool, no majority drown
 
 Key Parameters
 --------------
-  k              int    KNN neighbours
+  k              int    KNN neighbours per class
   n_prototypes   int    prototypes per class
   branch_set     str    'default', 'extended', or 'tac_family'
   device         str    'auto', 'cuda', 'cpu', or a specific device string
@@ -89,25 +108,20 @@ except ImportError:
 
 
 # ── Branch registry ──────────────────────────────────────────────────────────
-# Single source of truth for branch definitions. Adding a new branch means
-# adding to BRANCH_NAMES + the dispatch in _avm_features + the dispatch in
-# _make_avm_combined (post-fit). Three places, no more.
 BRANCH_SETS = {
     'default':    ['tac', 'b',    'cir'],
     'extended':   ['tac', 'b',    'cir', 'sq', 'mtac'],
     'tac_family': ['tac', 'mtac', 'sq'],
 }
 
-# Init values for raw gate parameters (pre-sigmoid).
 BRANCH_INITS = {
-    'tac':  0.5,   # +0.5 head start (original design)
-    'b':    0.5,   # +0.5 head start (original design)
+    'tac':  0.5,
+    'b':    0.5,
     'cir':  0.0,
-    'sq':   0.0,   # let gradient decide
-    'mtac': 0.0,   # let gradient decide
+    'sq':   0.0,
+    'mtac': 0.0,
 }
 
-# Display names for summary()
 BRANCH_DISPLAY = {
     'tac':  'tanh_arccos',
     'b':    'boundary',
@@ -122,6 +136,29 @@ def _resolve_device(spec):
     if spec == 'auto':
         return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     return torch.device(spec)
+
+
+def _build_faiss_index(X, dim, use_ivf=True):
+    """
+    Build a FAISS L2 index over X. Uses IVF for large collections, Flat
+    otherwise. Returns the index.
+    """
+    n = X.shape[0]
+    if use_ivf and n >= 78:
+        nlist = max(1, min(1000, n // 39, int(np.sqrt(n))))
+        try:
+            quantizer = faiss.IndexFlatL2(dim)
+            index = faiss.IndexIVFFlat(
+                quantizer, dim, nlist, faiss.METRIC_L2)
+            index.train(X)
+            index.nprobe = min(10, nlist)
+            index.add(X)
+            return index, ('IVF', nlist)
+        except MemoryError:
+            pass
+    index = faiss.IndexFlatL2(dim)
+    index.add(X)
+    return index, ('Flat', None)
 
 
 class LearningAVNN(BaseEstimator, ClassifierMixin):
@@ -222,19 +259,14 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             else:
                 self.log_tau = nn.Parameter(torch.tensor(-0.5))
 
-            # AVM branch gates — one raw weight per active branch.
-            # ParameterDict so we only create what we use (no dead weights
-            # fighting weight_decay).
             self.raw_w = nn.ParameterDict({
                 name: nn.Parameter(torch.tensor(BRANCH_INITS[name]))
                 for name in self.active_branches
             })
 
-            # Feature weights — shared with the KNN voter post-fit
             self.raw_feat_w = nn.Parameter(torch.zeros(n_feat))
 
         def _avm_branch_weights(self):
-            """Active branches — normalised sigmoid over active gates only."""
             raw   = torch.stack(
                 [self.raw_w[name] for name in self.active_branches])
             gates = torch.sigmoid(raw)
@@ -242,17 +274,10 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
 
         def _feat_weights(self):
             w = torch.softmax(self.raw_feat_w, dim=0)
-            return w * self.n_feat   # uniform = 1.0 each
+            return w * self.n_feat
 
         @staticmethod
         def _boundary_dists(x, eps, dual=False):
-            """
-            Distances to hypercube face centres.
-            dual=False: (N, F)  distances to +e_f only.
-            dual=True:  (N, 2F) distances to +e_f and -e_f interleaved.
-              pos: ||x - e_f||² = ||x||² - 2x_f + 1
-              neg: ||x + e_f||² = ||x||² + 2x_f + 1
-            """
             norm_sq     = (x**2).sum(dim=1, keepdim=True)
             dist_sq_pos = (norm_sq - 2.0*x + 1.0).clamp(min=eps)
             if not dual:
@@ -262,11 +287,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             return torch.sqrt(stacked.reshape(stacked.shape[0], -1))
 
         def _branch_feature(self, name, x, wf, sqwf):
-            """
-            Compute a single branch's per-feature output (pre-gate-weighting).
-            One dispatch table keeps the torch path aligned with the post-fit
-            numpy path (_np_branch_feature in fit()).
-            """
             eps = self.eps
             if name == 'tac':
                 a = torch.acos(torch.clamp(x, -1+eps, 1-eps))
@@ -283,7 +303,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             raise ValueError(f"unknown branch: {name}")
 
         def _avm_features(self, x, wf):
-            """AVM combined vector — concat of all active branches, gated."""
             sqwf = wf.sqrt()
             wa   = self._avm_branch_weights()
             parts = []
@@ -293,10 +312,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             return torch.cat(parts, dim=1)
 
         def forward(self, x):
-            """
-            AVM forward pass — scores distances in the active branch space
-            to K*m learnable prototypes. Returns (proba, fw, embeddings).
-            """
             wf   = self._feat_weights()
             N    = x.shape[0]
             K, m = self.K, self.m
@@ -322,7 +337,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
     # ── loss ──────────────────────────────────────────────────────────────────
 
     def _ordinal_loss(self, probs, targets):
-        """Earth Mover's Distance — penalises ordinal mistakes proportionally."""
         N, K   = probs.shape
         cdf_p  = torch.cumsum(probs, dim=1)[:, :-1]
         k_idx  = torch.arange(K - 1, device=targets.device)
@@ -330,10 +344,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         return torch.abs(cdf_p - cdf_y).mean()
 
     def _supcon_loss(self, embeddings, targets):
-        """
-        Supervised Contrastive Loss (Khosla et al., 2020).
-        Pulls same-class AVM embeddings together, pushes apart different.
-        """
         z = nn.functional.normalize(embeddings, dim=1)
         N = z.shape[0]
 
@@ -364,7 +374,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         K   = probs.shape[1]
         nll = nn.NLLLoss(weight=class_weights)(
                   torch.log(probs.clamp(1e-10)), targets)
-        # Label smoothing: (1-α)*NLL + α * mean_k(-log p_k)
         smooth_term = -torch.log(probs.clamp(1e-10)).mean(dim=1).mean()
         ce  = (1.0 - self.label_smoothing) * nll + self.label_smoothing * smooth_term
 
@@ -375,7 +384,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             self.net_.centroids - self.net_.centroid_anchor
         ).pow(2).mean()
 
-        # Centroid separation — cached per epoch, reused across batches.
         if self.net_._sep_cache is None:
             if self.net_.K > 1:
                 _K, _m = self.net_.K, self.net_.m
@@ -434,10 +442,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
     # ── composite validation metric ───────────────────────────────────────────
 
     def _val_score(self, y_true, y_pred):
-        """
-        Composite validation metric from a single confusion matrix.
-        Faster than three sklearn metric calls.
-        """
         from sklearn.metrics import confusion_matrix
         labels = np.arange(len(self.classes_))
         cm     = confusion_matrix(y_true, y_pred, labels=labels).astype(float)
@@ -472,7 +476,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                 f"branch_set must be one of {list(BRANCH_SETS)}, "
                 f"got {self.branch_set!r}")
 
-        # ── Device resolution ────────────────────────────────────────────────
         device = _resolve_device(self.device)
         self.device_ = device
         use_amp = bool(self.use_amp) and device.type == 'cuda'
@@ -514,7 +517,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         X_tr_n = self._norm_apply(X_tr)
         X_va_n = self._norm_apply(X_va)
 
-        # All training/val tensors created directly on device.
         def tt(a, long=False):
             return torch.tensor(a,
                 dtype=torch.long if long else torch.float32,
@@ -528,9 +530,7 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
 
         m = max(1, int(self.n_prototypes))
 
-        # Prototypes initialised at class mean with small jitter for m>1
-        rng_proto = np.random.default_rng(
-            (self.random_state or 0) + 1)
+        rng_proto = np.random.default_rng((self.random_state or 0) + 1)
         class_means = np.stack([
             X_tr_n[y_tr == i].mean(0) for i in range(K)])
         proto_init  = np.tile(
@@ -566,24 +566,18 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         bs     = self.batch_size
         n_batch = max(1, N_tr // bs)
 
-        # Cache class means once — they don't change with epochs and they
-        # drive the m=1 EMA path. Big memory-bandwidth win on imbalanced
-        # data (avoid re-copying the majority class every epoch).
         class_means_t = None
         if self.ema_centroids and m == 1:
             with torch.no_grad():
                 class_means_t = torch.stack([
                     X_tr_t[y_tr_t == cls].mean(0) for cls in range(K)
-                ])  # (K, F), on device
+                ])
 
         val_every = 5
         best_f1, best_state, wait = -1.0, None, 0
         WARMUP = 20
 
         for epoch in range(self.epochs):
-            # Index-on-demand shuffle: permutation tensor lives on device,
-            # we slice it for each batch and gather rows from X_tr_t.
-            # No full-tensor copy per epoch (was X_shuf = X_tr_t[perm]).
             perm = torch.from_numpy(rng.permutation(N_tr)).to(
                 device, non_blocking=True)
 
@@ -619,19 +613,14 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                     opt.step()
             sch.step()
 
-            # EMA centroid update
             if self.ema_centroids:
                 self.net_.eval()
                 with torch.no_grad():
                     if m == 1:
-                        # Vectorised: blend all centroids against cached means.
-                        # No per-class mask, no per-class allocation.
                         self.net_.centroids.data[:, 0] = (
                             self.ema_beta * self.net_.centroids.data[:, 0]
                             + (1.0 - self.ema_beta) * class_means_t)
                     else:
-                        # Soft-assigned weighted mean — depends on current
-                        # prototype positions, has to run per epoch.
                         for cls in range(K):
                             mask = (y_tr_t == cls)
                             if mask.sum() == 0:
@@ -653,7 +642,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                                     self.ema_beta       * protos[j]
                                     + (1.0 - self.ema_beta) * wm)
 
-            # Skip validation on non-val epochs
             if (epoch + 1) % val_every != 0 and epoch < self.epochs - 1:
                 if self.verbose and (epoch + 1) % 10 == 0:
                     wa = self.net_._avm_branch_weights().detach().cpu().numpy()
@@ -700,15 +688,12 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         self._n_val_      = len(X_va)
         self.active_branches_ = list(self.net_.active_branches)
 
-        # Extract learned parameters (host-side numpy)
         with torch.no_grad():
             self.branch_weights_ = self.net_._avm_branch_weights().cpu().numpy().copy()
             self.feat_weights_   = self.net_._feat_weights().cpu().numpy().copy()
             self.tau_            = torch.exp(self.net_.log_tau).cpu().numpy().copy()
 
         # ── Post-fit numpy combined-vector builders ──────────────────────────
-        # All inference paths run on numpy (CPU) — FAISS and Mahalanobis live
-        # there. Extract the learned scaling factors once.
         sqfw   = np.sqrt(self.feat_weights_).astype(np.float32)
         wa     = self.branch_weights_
         active = self.active_branches_
@@ -753,7 +738,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                                for i in range(0, len(xn), batch_size)])
 
         def _make_knn_combined(xn, batch_size=10_000):
-            """KNN space: linear + shape + quadratic (3F), uniform branches."""
             def _chunk(chunk):
                 eps = 1e-7
                 lin = chunk * sqfw
@@ -771,7 +755,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         self._make_avm_combined = _make_avm_combined
         self._make_knn_combined = _make_knn_combined
 
-        # Extract learned prototype positions in AVM combined space
         raw_c_n     = self.net_.centroids.detach().cpu().numpy()
         init_c_n    = self.net_.centroid_anchor.cpu().numpy()
         raw_c_flat  = raw_c_n.reshape(K * m, n_feat)
@@ -779,7 +762,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             raw_c_flat).astype(np.float32)
         self.n_prototypes_ = m
 
-        # Drift: mean distance each prototype moved from its anchor
         drift_flat = np.sqrt(((raw_c_n - init_c_n) ** 2).sum(-1))
         self.centroid_drift_ = drift_flat.mean(1)
 
@@ -793,7 +775,7 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                 print(f"  centroid cls{self.classes_[i]}: "
                       f"n={int(counts_tr[i])}  drift=[{proto_drifts}]")
 
-        # Mahalanobis RDA covariance — see comments below for math
+        # Mahalanobis RDA covariance — see comments in earlier versions
         if self.mahalanobis:
             X_tr_c = _make_avm_combined(X_tr_n)
             D      = X_tr_c.shape[1]
@@ -811,9 +793,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             alpha          = float(self.mahal_alpha)
             ridge          = float(self.mahal_reg)
 
-            # Build per-prototype soft assignments in normalised space.
-            # CPU tensor — the soft-assignment math is tiny (~K*n_k*m) and
-            # not worth the device round-trip for this one-shot computation.
             X_tr_n_t = torch.tensor(X_tr_n, dtype=torch.float32)
 
             for i in range(K):
@@ -859,43 +838,92 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         else:
             self.cov_inv_ = None
 
-        # FAISS index
+        # ── Class-conditional KNN voter ──────────────────────────────────────
+        # Build K separate FAISS indices, one per class, over each class's
+        # training points in KNN combined space. Each test point will query
+        # every index for its k nearest in-class neighbours. Per-class
+        # inverse-distance score → probability. Per-class minimum distance
+        # → novelty signal.
         self.lambda_ = self.lam_floor
+        self.knn_indexes_ = None
+        self.knn_index_kinds_ = None
+        self.dist_scale_per_class_ = None
+        self.knn_class_counts_ = None
+
         if not _HAS_FAISS:
             if self.verbose:
                 print("  faiss not installed — KNN disabled, lambda=1.0")
             self.lambda_ = 1.0
-            self.index_  = None
         else:
-            X_tr_c  = _make_knn_combined(X_tr_n)
-            dim     = X_tr_c.shape[1]
-            N_build = X_tr_c.shape[0]
-            built  = False
-            if self.use_ivf and N_build >= 78:
-                nlist = max(1, min(
-                    1000, N_build // 39,
-                    int(np.sqrt(N_build))))
-                try:
-                    quantizer = faiss.IndexFlatL2(dim)
-                    index = faiss.IndexIVFFlat(
-                        quantizer, dim, nlist, faiss.METRIC_L2)
-                    index.train(X_tr_c)
-                    index.nprobe = min(10, nlist)
-                    built = True
-                    if self.verbose:
-                        print(f"  FAISS IVF: nlist={nlist}"
-                              f" nprobe={index.nprobe}")
-                except MemoryError:
-                    if self.verbose:
-                        print("  FAISS IVF OOM — falling back to FlatL2")
-            if not built:
-                index = faiss.IndexFlatL2(dim)
-                if self.verbose:
-                    print(f"  FAISS Flat: {N_build} vectors dim={dim}")
-            index.add(X_tr_c)
-            self.index_           = index
-            self.train_class_idx_ = y_tr.copy()
+            X_tr_c = _make_knn_combined(X_tr_n)
+            dim    = X_tr_c.shape[1]
 
+            self.knn_indexes_         = []
+            self.knn_index_kinds_     = []
+            self.dist_scale_per_class_ = []
+            self.knn_class_counts_     = []
+
+            for cls_idx in range(K):
+                cls_mask = (y_tr == cls_idx)
+                X_cls    = np.ascontiguousarray(X_tr_c[cls_mask])
+                n_cls    = len(X_cls)
+                self.knn_class_counts_.append(int(n_cls))
+
+                if n_cls == 0:
+                    # Degenerate — class has no training samples in this fold.
+                    # Build a dummy 1-point index that will always return
+                    # large distances.
+                    dummy = np.zeros((1, dim), dtype=np.float32)
+                    idx, kind = _build_faiss_index(
+                        dummy, dim, use_ivf=False)
+                    self.knn_indexes_.append(idx)
+                    self.knn_index_kinds_.append(('Empty', None))
+                    self.dist_scale_per_class_.append(1.0)
+                    continue
+
+                idx, kind = _build_faiss_index(
+                    X_cls, dim, use_ivf=self.use_ivf)
+                self.knn_indexes_.append(idx)
+                self.knn_index_kinds_.append(kind)
+
+                # Per-class typical intra-class distance — calibrates the
+                # novelty signal. We self-search a subsample of the class
+                # for k=2 (self + nearest other), take the linear-distance
+                # to the nearest neighbour (skip self), median across the
+                # subsample. Linear (sqrt) distance for interpretability,
+                # FAISS returns squared L2.
+                if n_cls >= 2:
+                    sub_n = min(5000, n_cls)
+                    if sub_n < n_cls:
+                        sub_idx = rng.choice(n_cls, sub_n, replace=False)
+                        X_sub = np.ascontiguousarray(X_cls[sub_idx])
+                    else:
+                        X_sub = X_cls
+                    D_self, _ = idx.search(X_sub, min(2, n_cls))
+                    # D_self[:, 0] is to self (0 for exact match);
+                    # D_self[:, 1] is to nearest other (squared L2).
+                    if D_self.shape[1] >= 2:
+                        nn_sq = D_self[:, 1]
+                    else:
+                        nn_sq = D_self[:, 0]
+                    nn_lin = np.sqrt(np.maximum(nn_sq, 0.0))
+                    scale  = float(np.median(nn_lin))
+                    self.dist_scale_per_class_.append(
+                        max(scale, 1e-6))
+                else:
+                    self.dist_scale_per_class_.append(1.0)
+
+            if self.verbose:
+                kind_summary = " ".join(
+                    f"cls{self.classes_[i]}:{self.knn_index_kinds_[i][0]}({self.knn_class_counts_[i]})"
+                    for i in range(K))
+                print(f"  KNN per-class indices: {kind_summary}")
+                scales = " ".join(
+                    f"cls{self.classes_[i]}:{self.dist_scale_per_class_[i]:.4f}"
+                    for i in range(K))
+                print(f"  KNN dist scales (typical intra-class): {scales}")
+
+            # Lambda selection on val set
             if self.entropy_lambda:
                 self.lambda_ = None
                 if self.verbose:
@@ -907,9 +935,10 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                 avm_val  = self._avm_proba(X_va_avm)
 
                 X_va_knn = _make_knn_combined(X_va_n)
-                knn_val  = self._knn_proba(X_va_knn)
+                knn_val, novelty_val = self._knn_proba(X_va_knn)
 
-                # Scalar grid search
+                # Option A: scalar grid search (ignores novelty — it's just
+                # a fixed AVM/KNN ratio)
                 n_steps     = int(round((1.0 - self.lam_floor) / 0.05)) + 1
                 lam_grid    = np.linspace(self.lam_floor, 1.0, n_steps)
                 best_lam_f1, best_lam = -1.0, self.lam_floor
@@ -921,10 +950,11 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                         best_lam_f1 = f1
                         best_lam    = lam_c
 
-                # Confidence-weighted gate
-                lam_conf, _ = self._lambda_gate(avm_val, knn_val)
-                p_conf      = lam_conf[:,None]*avm_val + (1-lam_conf[:,None])*knn_val
-                conf_f1     = self._val_score(y_va, p_conf.argmax(1))
+                # Option B: confidence-weighted gate (uses novelty)
+                lam_conf, _ = self._lambda_gate(
+                    avm_val, knn_val, knn_novelty=novelty_val)
+                p_conf  = lam_conf[:,None]*avm_val + (1-lam_conf[:,None])*knn_val
+                conf_f1 = self._val_score(y_va, p_conf.argmax(1))
 
                 if conf_f1 >= best_lam_f1:
                     self.lambda_ = None
@@ -944,8 +974,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
 
     @staticmethod
     def _invert_cov(S, ridge, D):
-        """Ridge-regularise and Cholesky-invert a covariance matrix.
-        Falls back to pseudo-inverse on numerical failure."""
         scale = np.diag(S).mean().clip(min=1e-10)
         S_reg = (1.0 - ridge) * S + ridge * scale * np.eye(D)
         try:
@@ -956,11 +984,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             return np.linalg.pinv(S_reg).astype(np.float32)
 
     def _avm_proba(self, combined):
-        """
-        Multi-prototype AVM scoring.
-        Aggregates inverse-distances per class by summing over prototypes.
-        Per-prototype Mahalanobis when n_prototypes>1.
-        """
         K = len(self.classes_)
         m = self.n_prototypes_
         N = combined.shape[0]
@@ -986,33 +1009,107 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         return raw / raw.sum(1, keepdims=True)
 
     def _knn_proba(self, combined, search_batch=50_000):
-        if self.index_ is None:
-            raise RuntimeError("FAISS index not built.")
+        """
+        Class-conditional KNN scoring.
+
+        For each test point and each class k, search class-k's FAISS index
+        for the k nearest in-class neighbours. The class-k score is the
+        mean inverse-distance to those neighbours; per-class scores are
+        normalised into a probability distribution.
+
+        Returns
+        -------
+        proba : (N, K) per-class probability from inverse-distance voting
+        novelty : (N,) novelty signal — distance to nearest in-class
+                  neighbour across all classes, normalised by the global
+                  median of per-class typical intra-class distances.
+                  novelty ≈ 1 means "typical training distance"; novelty
+                  >> 1 means "far from every class manifold."
+        """
+        if self.knn_indexes_ is None:
+            raise RuntimeError("FAISS indices not built.")
         n_test = combined.shape[0]
         K      = len(self.classes_)
-        proba  = np.zeros((n_test, K), dtype=np.float32)
-        for start in range(0, n_test, search_batch):
-            end       = min(start + search_batch, n_test)
-            dist, idx = self.index_.search(combined[start:end], self.k)
-            w = 1.0 / (dist + 1e-10)
-            w = w / w.sum(1, keepdims=True)
-            labels = self.train_class_idx_[idx]
-            B = end - start
-            batch_p = np.zeros((B, K), dtype=np.float32)
-            for ki in range(self.k):
-                batch_p[np.arange(B), labels[:, ki]] += w[:, ki]
-            proba[start:end] = batch_p
-        return proba
 
-    def _lambda_gate(self, avm, knn):
-        """Confidence-weighted gate: lambda = conf_AVM / (conf_AVM + conf_KNN)."""
+        # Score per class: mean inverse-distance over class-k neighbours
+        proba_raw    = np.zeros((n_test, K), dtype=np.float64)
+        # Track nearest-neighbour distance per class for novelty
+        nearest_sq   = np.full((n_test, K), np.inf, dtype=np.float64)
+
+        combined_c = np.ascontiguousarray(combined)
+
+        for cls_idx in range(K):
+            idx_obj = self.knn_indexes_[cls_idx]
+            n_in_idx = idx_obj.ntotal
+            if n_in_idx == 0:
+                # Empty class (shouldn't happen with stratified split, but
+                # be defensive). Score stays 0; nearest stays inf.
+                continue
+
+            k_search = min(self.k, n_in_idx)
+
+            for start in range(0, n_test, search_batch):
+                end = min(start + search_batch, n_test)
+                dist, _ = idx_obj.search(combined_c[start:end], k_search)
+                # FAISS returns squared L2 for IndexFlatL2 / IndexIVFFlat
+                # Inverse-distance vote (per-neighbour weights, then mean)
+                w = 1.0 / (dist + 1e-10)
+                proba_raw[start:end, cls_idx] = w.mean(1)
+                # Track nearest (smallest squared distance)
+                nearest_sq[start:end, cls_idx] = dist[:, 0]
+
+        # Normalise into probabilities. If a row is all-zero (no class has
+        # any training data — pathological case) fall back to uniform.
+        row_sums = proba_raw.sum(1, keepdims=True)
+        row_sums = np.where(row_sums > 0, row_sums, 1.0)
+        proba    = (proba_raw / row_sums).astype(np.float32)
+
+        # Novelty: linear distance to the single nearest in-class neighbour
+        # (across all classes), normalised by the global median of per-class
+        # typical intra-class distances. The global median is used so the
+        # novelty value is comparable across classes — a per-class scale
+        # would let the model declare every test point "typical for some
+        # class" which defeats the purpose.
+        nearest_lin = np.sqrt(np.maximum(nearest_sq.min(1), 0.0))
+        global_scale = float(np.median(self.dist_scale_per_class_))
+        novelty = (nearest_lin / max(global_scale, 1e-10)).astype(np.float32)
+
+        return proba, novelty
+
+    def _lambda_gate(self, avm, knn, knn_novelty=None):
+        """
+        Confidence-weighted gate: lambda = conf_AVM / (conf_AVM + conf_KNN).
+
+        Confidence sources:
+          AVM: 1 - normalised entropy of AVM probabilities
+          KNN: (1 - normalised entropy of KNN probabilities)
+               × novelty_factor (if novelty signal provided)
+
+        Novelty factor:  1 / (1 + max(novelty - 1, 0)^2)
+          novelty=1 → factor=1.0   (typical training distance)
+          novelty=2 → factor=0.5   (twice as far as typical)
+          novelty=3 → factor=0.2
+          novelty=5 → factor=0.06
+        This means a test point that's far from every class manifold has
+        its KNN confidence collapsed, so the gate leans on AVM (or, if
+        AVM is also uncertain, the lambda gets pulled to the lam_uncertain
+        floor and the prediction is genuinely a coin flip — which is the
+        honest answer).
+        """
         K     = len(self.classes_)
         log_K = np.log(K + 1e-10)
         H_avm = -(avm * np.log(avm.clip(1e-10))).sum(1) / log_K
         H_knn = -(knn * np.log(knn.clip(1e-10))).sum(1) / log_K
         c_avm = 1.0 - H_avm
         c_knn = 1.0 - H_knn
-        lam   = (c_avm / (c_avm + c_knn + 1e-10)).clip(
+
+        if knn_novelty is not None:
+            # Inverse-quadratic falloff above novelty=1
+            excess = np.maximum(knn_novelty - 1.0, 0.0)
+            novelty_factor = 1.0 / (1.0 + excess * excess)
+            c_knn = c_knn * novelty_factor
+
+        lam = (c_avm / (c_avm + c_knn + 1e-10)).clip(
             self.lam_uncertain, self.lam_confident)
         overlap  = np.minimum(avm, knn).sum(1)
         disagree = c_avm * c_knn * (1 - overlap)
@@ -1025,11 +1122,11 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         Xn_avm = self._make_avm_combined(Xn)
         avm    = self._avm_proba(Xn_avm)
 
-        if self.index_ is None or (
+        if self.knn_indexes_ is None or (
                 self.lambda_ is not None and self.lambda_ >= 1.0):
             return avm
 
-        knn = self._knn_proba(self._make_knn_combined(Xn))
+        knn, novelty = self._knn_proba(self._make_knn_combined(Xn))
 
         if self.entropy_lambda:
             K   = len(self.classes_)
@@ -1040,7 +1137,7 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             return lam[:,None]*avm + (1-lam[:,None])*knn
 
         elif self.lambda_ is None:
-            lam, _ = self._lambda_gate(avm, knn)
+            lam, _ = self._lambda_gate(avm, knn, knn_novelty=novelty)
             return lam[:,None]*avm + (1-lam[:,None])*knn
 
         else:
@@ -1051,8 +1148,8 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
 
     def predict_with_uncertainty(self, X):
         """
-        Returns (predictions, proba, disagreement_scores).
-        Gate weights AVM vs KNN by per-sample confidence.
+        Returns (predictions, proba, disagreement, novelty).
+        Gate weights AVM vs KNN by per-sample confidence including novelty.
         """
         check_is_fitted(self, 'centroids_combined_')
         X      = np.asarray(X, dtype=np.float32)
@@ -1060,14 +1157,15 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         Xn_avm = self._make_avm_combined(Xn)
         avm    = self._avm_proba(Xn_avm)
 
-        if self.index_ is None:
+        if self.knn_indexes_ is None:
             zero_d = np.zeros(len(X), dtype=np.float32)
-            return self.classes_[avm.argmax(1)], avm, zero_d
+            zero_n = np.zeros(len(X), dtype=np.float32)
+            return self.classes_[avm.argmax(1)], avm, zero_d, zero_n
 
-        knn = self._knn_proba(self._make_knn_combined(Xn))
-        lam, disagree = self._lambda_gate(avm, knn)
+        knn, novelty  = self._knn_proba(self._make_knn_combined(Xn))
+        lam, disagree = self._lambda_gate(avm, knn, knn_novelty=novelty)
         proba         = lam[:,None]*avm + (1-lam[:,None])*knn
-        return self.classes_[proba.argmax(1)], proba, disagree
+        return self.classes_[proba.argmax(1)], proba, disagree, novelty
 
     def class_distribution(self, as_dict=False):
         check_is_fitted(self, 'classes_')
@@ -1083,7 +1181,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             for c, n in zip(self.classes_, counts))
 
     def summary(self, feature_names=None):
-        """Print a human-readable model summary after fitting."""
         check_is_fitted(self, 'branch_weights_')
         names = (list(feature_names) if feature_names is not None
                  else [f"f{i}" for i in range(len(self.feat_weights_))])
@@ -1129,7 +1226,18 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             lines.append(
                 f"    {BRANCH_DISPLAY[ab[i]]:<12}: {bw[i]:.4f}")
         lines += [
-            f"  KNN voter   : fixed-feature FAISS index (no learned weights)",
+            f"  KNN voter   : class-conditional ({K} per-class indices)",
+        ]
+        # Per-class KNN info if available
+        if getattr(self, 'knn_class_counts_', None) is not None:
+            lines.append("  Per-class KNN:")
+            for ci, cls in enumerate(self.classes_):
+                kind = self.knn_index_kinds_[ci][0] if self.knn_index_kinds_ else '?'
+                cnt  = self.knn_class_counts_[ci]
+                sc   = self.dist_scale_per_class_[ci]
+                lines.append(
+                    f"    class {cls}: n={cnt}  index={kind}  scale={sc:.4f}")
+        lines += [
             "",
             f"  Feature weights (top 5):",
         ]
