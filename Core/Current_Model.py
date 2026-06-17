@@ -1,60 +1,113 @@
 """
 LearningAVNN
 ============
-Geometric tabular classifier combining Angular Vector Machines (AVM)
-with FAISS-accelerated KNN and a suite of learned geometric corrections.
+Geometric tabular classifier combining a learned Angular Vector Machine (AVM)
+prototype space with FAISS-accelerated KNN and optional Fisher/geodesic heads.
+
+Two-stage design (note the asymmetry — it is deliberate)
+-------------------------------------------------------
+  TRAIN     prototype positions, branch gates, feature weights and per-class
+            tau are learned under Euclidean inverse-distance scoring in the
+            AVM feature space (cheap, well-conditioned, no covariance needed).
+  INFERENCE the frozen prototypes are re-scored with a full QDA posterior:
+            per-prototype RDA covariance estimated post-fit, then
+
+              log p(k|x) ∝ log π_k
+                         + logsumexp_{p∈k}[ −0.5·log|Σ_p| − 0.5·d²_M(x, c_p) ]
+
+            (the −0.5·D·log 2π and −log m constants cancel in the softmax over
+            k; the logsumexp marginalises the m prototypes of a class as an
+            equal-weight Gaussian mixture).
+  Prototypes are therefore Euclidean-optimal but scored under QDA. Closing this
+  loop (mid-training covariance re-estimation) is possible but unimplemented.
+  tau is a TRAINING-only sharpness knob — inference has never used it.
 
 Architecture
 ------------
   Input → MinMax normalise [-1,1]
-       → AVM: three-branch combined vector
-            → Mahalanobis inverse-distance to K×m learnable prototypes
-       → KNN: separate three-branch combined vector
-            → FAISS inverse-distance vote over k nearest training points
-       → λ·AVM + (1-λ)·KNN  (λ auto-tuned on val set post-training)
+       → AVM space:  three-branch vector (tac + boundary + circular)
+            → per-prototype QDA posterior over K×m learnable prototypes
+       → KNN space:  separate frozen three-branch vector (linear+shape+quad,
+                     plus optional log/rank/clr), FAISS inverse-distance vote
+       → fusion: avm_only | λ-blend (avm+knn) | confidence-gate | static
+       → optional prior tempering (prior_temp) on the fused posterior
 
 AVM Branches  (global structure — centroid proximity)
 -----------------------------------------------------
   tanh_arccos  tanh(arccos(x)·0.8)·√fw   monotone nonlinear, centre-amplified
                high at x≈-1, zero at x≈+1; most sensitive near x=0
   boundary     √(‖x‖²-2x+1)              cross-feature coupling via ‖x‖²
-               optional dual_boundary adds negative-face distances (2F)
+               optional dual_boundary adds negative-face distances (2F).
+               NOT feature-weighted — the ‖x‖² coupling makes per-feature
+               weighting ill-defined (intentional asymmetry; consistent across
+               the torch train path and the numpy inference path).
   circular     √(1-x²)·√fw               symmetric extremeness at ±1
 
   Gates: independent normalised-sigmoid (not softmax) — tac and boundary
   both initialised with +0.5 bias head start over circular.
 
-KNN Branches  (local structure — neighbourhood similarity)
-----------------------------------------------------------
+KNN Branches  (local structure — neighbourhood similarity, frozen)
+------------------------------------------------------------------
   linear       x·√fw           signed magnitude, direct local proximity
   shape        (x-μ)/σ         within-sample relative profile fingerprint
   quadratic    x²·√fw          nonlinear extremeness, different from circular
+  optional:    log (multiplicative) · rank (monotone) · clr (compositional) ·
+               interaction (cross-feature products x_i·x_j, i<j, random-
+               projected to interaction_dim coords and z-scored — the cheap
+               probe for whether nonlinear feature interactions carry signal)
 
-  KNN branch weights are parameters but receive no gradient (the KNN
-  space is not used in the training forward pass). They encode a fixed
-  geometric view that complements the learned AVM space.
+  KNN branch weights are parameters but receive no gradient (the KNN space is
+  not used in the training forward pass). They encode a fixed geometric view.
 
 Learnable Prototypes
 --------------------
   K×m prototype positions (nn.Parameter). n_prototypes=1 → single centroid.
   n_prototypes>1 → multimodal class representation (e.g. bimodal quality).
-  centroid_sep / intra_sep — cached per epoch, prototypes pushed apart
-  during training via detached separation loss.
+  centroid_sep / intra_sep — recomputed (ATTACHED) every batch, prototypes
+  pushed apart during training.
 
-  boundary_init (opt-in) — when m > 1, places prototype 0 at the class
-  centroid (interior anchor) and prototypes 1..m-1 at the lowest-positive-
-  margin training points (boundary medoids). Each class gets an explicit
-  bulk representative and one or more frontier defenders.
+  boundary_init (opt-in, m>1) — prototype 0 at the class centroid (interior
+  anchor), prototypes 1..m-1 at the lowest-positive-margin training points
+  (boundary medoids).
+
+Discriminant / covariance
+-------------------------
+  Per-prototype RDA:  Σ_p = (1−α)·S_p + α·S_pooled, ridge-regularised, then
+  Cholesky-inverted; log|Σ_p| is captured from the Cholesky factor and feeds
+  the QDA volume term, scaled by logdet_weight (1.0 = full QDA; 0.0 drops the
+  volume term for robustness when D is large relative to per-prototype n, where
+  the determinant is dominated by ridge-floored noise directions). Covariance
+  is estimated on per-column-STANDARDISED combined features (avm_scale_) so the
+  ridge / RDA pooling is not dominated by the boundary block (∝ √F scale). The
+  same standardisation is applied to the query and the centroids inside
+  _avm_proba. Σ_p is centred on the soft-assigned empirical mean while the
+  Gaussian component is centred on the learned prototype c_p; for m=1 these
+  coincide, for m>1 they differ by design.
 
 Imbalance Handling
 ------------------
   SupCon loss     — pulls same-class AVM embeddings together per batch
-  Per-class tau   — each class learns its own scoring sharpness
-  Mahalanobis RDA — full per-class covariance at inference (α-blended QDA/LDA)
+  Per-class tau   — per-class training sharpness
+  Mahalanobis QDA — full per-class/per-prototype covariance at inference
   Class weights   — balanced NLL capped at weight_cap
   Ordinal EMD     — Earth Mover's Distance for ordered class structures
   EMA centroids   — exponential moving average stabilises minority prototypes
+                    (optimizer state for the centroid param is reset after each
+                    EMA write so stale Adam momentum can't fight the EMA pull)
+  log π_k prior   — built into the QDA score, scaled by prior_weight (set 0 to
+                    drop it and lift minority recall on imbalanced data); the
+                    separate prior_temp still tempers the post-fusion decision
+  Score form      — avm_score='inverse_distance' restores the flat heavy-tailed
+                    vote the entropy gates were calibrated to (vs sharp QDA)
   val_macro_bias  — early stopping biased toward macro F1 over accuracy
+
+Known asymmetries / caveats
+---------------------------
+  • Train (Euclidean) vs inference (QDA) metric mismatch — see Two-stage design.
+  • ortho_reg groups embeddings by the THREE semantic AVM branches; under dual
+    boundary the 2F block is collapsed to its positive faces before the Gram.
+  • Label smoothing is unweighted while NLL is class-weighted (left deliberate).
+  • FAISS IVF k-means is not seeded by random_state (KNN head non-deterministic).
 
 Key Parameters
 --------------
@@ -62,12 +115,22 @@ Key Parameters
   n_prototypes   int    prototypes per class
   boundary_init  bool   boundary-medoid placement for m>1 (default False)
   mahal_alpha    float  RDA blend (0=QDA, 1=LDA)
+  logdet_weight  float  scales the QDA volume term −0.5·log|Σ_k| (1=full QDA,
+                        0=distance+prior only; lower for high-D / low-n)
+  avm_score      str    'qda' (sharp softmax, correct) | 'inverse_distance'
+                        (flat Σ 1/d_M vote; recovers pre-QDA calibration)
+  prior_weight   float  scales the empirical class prior π_k in both score
+                        modes (1=full prior; 0=no prior → higher minority recall)
+  interaction_dim int|'auto'  output width of the 'interaction' KNN branch
+                        ('auto' = n_features); random-projected pairwise products
   lam_floor      float  minimum AVM weight in lambda grid search
   val_macro_bias float  0=accuracy, 1=macro F1 for early stopping
   supcon         bool   supervised contrastive loss
   ema_centroids  bool   EMA prototype stabilisation
   ortho_reg      float  Gram matrix branch decorrelation
-  use_dual_boundary bool  extend boundary branch to 2F
+  use_dual_boundary bool extend boundary branch to 2F
+  prior_temp     float  tempering exponent on the QDA log prior (0 = single
+                        built-in prior; >0 over-weights it post-fusion)
 """
 
 import numpy as np
@@ -95,6 +158,7 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                  use_dual_boundary=False,
                  ortho_reg=0.01,
                  mahalanobis=True, mahal_reg=1e-6, mahal_alpha=0.5,
+                 logdet_weight=1.0, avm_score='qda', prior_weight=1.0,
                  lam_floor=0.5, entropy_lambda=False,
                  lam_confident=0.90, lam_uncertain=0.40,
                  ordinal=False, ordinal_weight=0.5,
@@ -106,6 +170,7 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                  ema_centroids=False, ema_beta=0.9,
                  heads=('avm', 'knn'),
                  knn_branches=('linear', 'shape', 'quadratic'),
+                 interaction_dim='auto',
                  geodesic_neighbors=10, geodesic_components=5,
                  geodesic_max_fit=4000,
                  device='auto',
@@ -130,6 +195,9 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         self.mahalanobis         = mahalanobis
         self.mahal_reg           = mahal_reg
         self.mahal_alpha         = mahal_alpha
+        self.logdet_weight       = logdet_weight
+        self.avm_score           = avm_score
+        self.prior_weight        = prior_weight
         self.lam_floor           = lam_floor
         self.entropy_lambda      = entropy_lambda
         self.lam_confident       = lam_confident
@@ -147,6 +215,7 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         self.ema_beta            = ema_beta
         self.heads               = heads
         self.knn_branches        = knn_branches
+        self.interaction_dim     = interaction_dim
         self.geodesic_neighbors  = geodesic_neighbors
         self.geodesic_components = geodesic_components
         self.geodesic_max_fit    = geodesic_max_fit
@@ -183,14 +252,11 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             else:
                 self.log_tau = nn.Parameter(torch.tensor(-0.5))
 
-
-
             # ── AVM branches (global structure — centroid proximity) ──────────
             # AVM branches: tac, boundary, circular
             self.raw_w_tac = nn.Parameter(torch.tensor(0.5))   # ↑ head start
             self.raw_w_b   = nn.Parameter(torch.tensor(0.5))   # ↑ head start
             self.raw_w_cir = nn.Parameter(torch.tensor(0.0))
-
 
             # ── KNN branches (local structure — neighbourhood similarity) ─────
             self.raw_w_lin  = nn.Parameter(torch.tensor(0.0))
@@ -279,11 +345,12 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                 wk[2].sqrt() * sqd,
             ], dim=1)
 
-
         def forward(self, x):
             """
-            AVM forward pass — scores distances in the global-structure
-            space (tac + bnd + cir) to K*m learnable prototypes.
+            AVM TRAINING forward pass — Euclidean inverse-distance over the
+            global-structure space (tac + bnd + cir) to K*m learnable
+            prototypes. This is the training metric only; inference re-scores
+            the same prototypes with the QDA posterior (see _avm_proba).
             Embeddings returned are AVM space — used for SupCon and ortho_reg.
             Returns (proba, feat_weights, embeddings).
             """
@@ -389,13 +456,12 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         K   = probs.shape[1]
         nll = nn.NLLLoss(weight=class_weights)(
                   torch.log(probs.clamp(1e-10)), targets)
-        # FIX: label smoothing math.
+        # Label smoothing math.
         # Target distribution: q_i = (1-α)*onehot_i + α/K  for all i.
         # CE = -Σ q_i log p_i = (1-α)*NLL + (α/K)*Σ_k -log p_k
         #    = (1-α)*NLL + α * mean_k(-log p_k)
-        # Previously: s = α/K, then s*mean(N,K)(-log p) which is
-        # (α/K) * (1/(N*K)) * Σ_N Σ_K -log p = α/K² weaker than spec.
-        # Corrected: take mean over K only, then mean over N via .mean().
+        # NOTE: NLL is class-weighted, the smoothing term is unweighted — left
+        # deliberate (smoothing acts as a uniform floor independent of balance).
         smooth_term = -torch.log(probs.clamp(1e-10)).mean(dim=1).mean()
         ce  = (1.0 - self.label_smoothing) * nll + self.label_smoothing * smooth_term
 
@@ -455,14 +521,25 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             ce  = (1.0 - self.supcon_weight) * ce + self.supcon_weight * sc
 
         if self.ortho_reg > 0.0 and embeddings is not None:
-            n_branches = embeddings.shape[1] // self.net_.n_feat
-            F_branch   = self.net_.n_feat
-            chunks  = embeddings[:, :n_branches * F_branch].reshape(
-                -1, n_branches, F_branch)
-            normed  = nn.functional.normalize(chunks, dim=2)
-            G       = torch.bmm(normed, normed.transpose(1, 2)).mean(0)
-            I       = torch.eye(n_branches, device=G.device)
-            ortho   = self.ortho_reg * (G - I).pow(2).sum()
+            # embeddings == AVM space: [tac(F), boundary(F or 2F), circular(F)].
+            # Decorrelate the THREE semantic branches. The old `width // n_feat`
+            # split was wrong under use_dual_boundary: the 2F interleaved
+            # boundary block was chopped into two fake F-branches. Collapse the
+            # boundary block to its positive faces (even columns) for an F-wide
+            # representative, then build a clean 3×3 Gram.
+            F = self.net_.n_feat
+            tac = embeddings[:, :F]
+            if self.net_.use_dual_boundary:
+                bnd = embeddings[:, F:3 * F][:, 0::2]   # positive faces → F-dim
+                cir = embeddings[:, 3 * F:]
+            else:
+                bnd = embeddings[:, F:2 * F]
+                cir = embeddings[:, 2 * F:]
+            chunks = torch.stack([tac, bnd, cir], dim=1)         # (N, 3, F)
+            normed = nn.functional.normalize(chunks, dim=2)
+            G      = torch.bmm(normed, normed.transpose(1, 2)).mean(0)
+            I      = torch.eye(3, device=G.device)
+            ortho  = self.ortho_reg * (G - I).pow(2).sum()
             return ce + fw_reg + c_anchor + c_sep + ortho
 
         return ce + fw_reg + c_anchor + c_sep
@@ -487,8 +564,9 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         pred_s = cm.sum(0)          # per-class predicted count
 
         acc  = tp.sum() / (total + 1e-10)
-        prec = np.zeros_like(f1 := np.zeros(len(labels)))
-        rec  = np.zeros_like(prec)
+        f1   = np.zeros(len(labels))
+        prec = np.zeros(len(labels))
+        rec  = np.zeros(len(labels))
         np.divide(tp, pred_s, out=prec, where=pred_s > 0)
         np.divide(tp, sup,    out=rec,  where=sup    > 0)
         denom = prec + rec
@@ -548,9 +626,11 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
 
         cw   = compute_class_weight('balanced', classes=self.classes_,
                                     y=y[tr_idx])
-        cw_t = torch.tensor(cw, dtype=torch.float32).clamp(
-            max=self.weight_cap)
-        cw_t = cw_t / cw_t.sum() * K
+        # Balanced class weights, capped. NLLLoss(reduction='mean') divides by
+        # the summed target weights, so any global rescale of cw is inert — keep
+        # only the cap (which changes the *relative* weights) and drop the old
+        # `/ sum * K` no-op.
+        cw_t = torch.tensor(cw, dtype=torch.float32).clamp(max=self.weight_cap)
 
         m = max(1, int(self.n_prototypes))
 
@@ -566,7 +646,7 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         #     margin training points (frontier defenders). See
         #     _boundary_medoid_init for details.
         rng_proto = np.random.default_rng(
-            (self.random_state or 0) + 1)
+            None if self.random_state is None else self.random_state + 1)
 
         if self.boundary_init and m > 1:
             proto_init = self._boundary_medoid_init(
@@ -607,13 +687,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         y_tr_t = tt(y_tr, long=True).to(dev)
         X_va_t = tt(X_va_n).to(dev)
         cw_t   = cw_t.to(dev)
-        # Cache val combined features — X_va_n never changes so
-        # _make_combined(X_va_n) produces the same result every val check.
-        # Pre-compute once here; reuse in every validation epoch.
-        # NOTE: this cache is in PyTorch space (for net forward), not numpy.
-        # It is invalidated implicitly — we never call _make_combined on val
-        # during training, only net_(X_va_t) which uses learnable weights.
-        # The PyTorch path doesn't use _make_combined so this is fine.
         N_tr   = len(X_tr_t)
         bs     = self.batch_size
         n_batch = max(1, N_tr // bs)
@@ -648,7 +721,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             # positions toward the actual mean of embedded training samples.
             # This stabilises minority class centroids whose backprop gradient
             # signal is weak (few samples → small contribution to NLL loss).
-            # EMA provides a direct geometric pull toward the empirical cluster.
             if self.ema_centroids:
                 self.net_.eval()
                 with torch.no_grad():
@@ -668,8 +740,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                         else:
                             # Multiple prototypes — soft assignment.
                             # Subsample for large classes to avoid O(N*m) cdist.
-                            # Soft assignment only needs to distinguish which
-                            # prototype is closer — doesn't need the full set.
                             _sub = cls_X
                             if len(cls_X) > 5000:
                                 _idx = torch.randperm(
@@ -684,13 +754,18 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                                 self.net_.centroids.data[cls, j] = (
                                     self.ema_beta       * protos[j]
                                     + (1.0 - self.ema_beta) * wm)
+                # EMA discontinuously relocates the centroids parameter; the
+                # Adam moment buffers (exp_avg / exp_avg_sq) still describe the
+                # pre-EMA position and would be misapplied on the next step,
+                # fighting the EMA pull — worst on the minority classes EMA is
+                # meant to help. Drop the optimizer state for this parameter so
+                # momentum re-accumulates from the new position.
+                opt.state.pop(self.net_.centroids, None)
 
             # Skip validation on non-val epochs.
-            # FIX: do NOT increment wait on skipped epochs. The val-epoch
-            # branch already adds +val_every (5) when val doesn't improve,
-            # which represents the full window since last val. Adding +1
-            # per skipped epoch was double-counting and halving effective
-            # patience.
+            # Do NOT increment wait on skipped epochs. The val-epoch branch adds
+            # +val_every (5) when val doesn't improve, representing the full
+            # window since last val; +1 per skipped epoch was double-counting.
             if (epoch + 1) % val_every != 0 and epoch < self.epochs - 1:
                 if self.verbose and (epoch + 1) % 10 == 0:
                     wa = self.net_._avm_branch_weights().detach().cpu().numpy()
@@ -727,7 +802,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         self.best_val_f1_ = best_f1
         self._n_train_    = len(X_tr)
         self._n_val_      = len(X_va)
-        # Store which branches/features were pruned for inspection
 
         # Extract learned parameters (move to CPU before numpy)
         with torch.no_grad():
@@ -752,11 +826,7 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         # KNN space: configurable branch set, frozen at uniform weight (the
         # KNN space gets no gradient, so its weights are fixed). Each branch
         # contributes F columns; the uniform sqrt-weight keeps the combined
-        # vector scale comparable as the branch set grows. linear/shape/quad
-        # are the originals; log/rank/clr are the added monotone & compositional
-        # views (they live here, not in the AVM space, because the KNN metric
-        # is plain Euclidean and pays no per-prototype covariance dimensionality
-        # tax for extra coordinates).
+        # vector scale comparable as the branch set grows.
         self.knn_branches_ = list(self.knn_branches)
         n_knn   = max(1, len(self.knn_branches_))
         wk_each = np.float32(np.sqrt(1.0 / n_knn))
@@ -765,6 +835,36 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                         if 'rank' in self.knn_branches_ else None)
         _clr_offset  = ((1e-6 - X_tr_n.min(0)).astype(np.float32)
                         if 'clr' in self.knn_branches_ else None)
+
+        # interaction branch (cheap probe): all off-diagonal pairwise products
+        # x_i·x_j (i<j) projected by a fixed seeded Gaussian to interaction_dim
+        # coords, then z-scored on train so the branch sits on the same scale as
+        # the others. A frozen transform (like _rank_sorted) — no learning, no
+        # per-step F² blow-up at inference beyond one (n_pairs × dim) matmul.
+        # Lives in the KNN space so it's isolated and doubles as a diagnostic:
+        # if it carries signal, the KNN head stops being auto-demoted (lambda
+        # drops / KNN fusion weight rises).
+        _intx = None
+        if 'interaction' in self.knn_branches_:
+            iu, ju  = np.triu_indices(n_feat, k=1)
+            n_pairs = int(len(iu))
+            idim    = (n_feat if self.interaction_dim in ('auto', None)
+                       else int(self.interaction_dim))
+            idim    = max(1, min(idim, max(1, n_pairs)))
+            rng_ix  = np.random.default_rng(
+                None if self.random_state is None else self.random_state + 7)
+            P = (rng_ix.standard_normal((n_pairs, idim)).astype(np.float32)
+                 / np.sqrt(max(1, n_pairs)))
+            prod_tr = (X_tr_n[:, iu] * X_tr_n[:, ju]).astype(np.float32)
+            proj_tr = prod_tr @ P                                    # (N, idim)
+            _intx = {'iu': iu, 'ju': ju, 'P': P,
+                     'mu': proj_tr.mean(0).astype(np.float32),
+                     'sd': proj_tr.std(0).clip(min=1e-6).astype(np.float32),
+                     'dim': idim, 'n_pairs': n_pairs}
+            self.interaction_info_ = {'n_pairs': n_pairs, 'dim': idim}
+            if self.verbose:
+                print(f"  interaction branch: {n_pairs} pairs → {idim} dims "
+                      f"(fixed random projection, z-scored)")
         self.branch_weights_ = np.array(
             [wa[0], wa[1], wa[2]] + [1.0 / n_knn] * n_knn, dtype=np.float64)
 
@@ -779,8 +879,7 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                     bnd_p = norm_sq - 2.0*chunk + 1.0           # (B, F)
                     bnd_n = norm_sq + 2.0*chunk + 1.0           # (B, F)
                     # Interleave [pos_f0, neg_f0, pos_f1, neg_f1, ...] to match
-                    # _Net._boundary_dists exactly (was block-concatenated here,
-                    # a silent layout drift between the train and inference paths).
+                    # _Net._boundary_dists exactly.
                     bnd_sq = np.stack([bnd_p, bnd_n], axis=2).reshape(
                         chunk.shape[0], -1)                     # (B, 2F)
                     bnd   = np.sqrt(bnd_sq.clip(min=eps))
@@ -817,6 +916,11 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                 xp = chunk + _clr_offset
                 lx = np.log(np.clip(xp, 1e-6, None))
                 return (lx - lx.mean(1, keepdims=True)).astype(np.float32)
+            if name == 'interaction':               # cross-feature products
+                prod = (chunk[:, _intx['iu']] *
+                        chunk[:, _intx['ju']]).astype(np.float32)
+                proj = prod @ _intx['P']
+                return ((proj - _intx['mu']) / _intx['sd']).astype(np.float32)
             raise ValueError(f"unknown KNN branch '{name}'")
 
         def _make_knn_combined(xn, batch_size=10_000):
@@ -841,16 +945,13 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         init_c_n    = self.net_.centroid_anchor.cpu().numpy()        # (K, m, F)
         raw_c_flat  = raw_c_n.reshape(K * m, n_feat)
         self.centroids_combined_ = _make_avm_combined(
-            raw_c_flat).astype(np.float32)                     # (K*m, 3F)
+            raw_c_flat).astype(np.float32)                     # (K*m, D)
         self.n_prototypes_ = m   # actual m used (post-fit)
-
 
         # Drift: mean distance each prototype moved from its anchor
         drift_flat = np.sqrt(
             ((raw_c_n - init_c_n) ** 2).sum(-1))              # (K, m)
         self.centroid_drift_ = drift_flat.mean(1)              # (K,) mean over protos
-        # Also expose per-prototype drift — useful for inspecting whether
-        # boundary-init protos stay near the frontier or drift to the bulk.
         self.centroid_drift_per_proto_ = drift_flat            # (K, m)
 
         counts_tr = np.array([(y_tr == i).sum() for i in range(K)],
@@ -865,30 +966,27 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
 
         # Regularised full Mahalanobis covariance in combined space
         #
-        # Diagonal Mahalanobis rescales each dimension independently —
-        # equivalent to an axis-aligned ellipsoid. It cannot represent
-        # correlated features (e.g. high-quality wine = high alcohol AND
-        # low volatile acidity jointly). Full covariance captures rotation:
-        # the decision boundary can align with the actual cluster orientation.
-        #
         # Estimation strategy: Regularised Discriminant Analysis (RDA)
         #   Σ_k = (1-α)*S_k + α*S_pooled
-        #
-        #   α → 0: full per-class QDA (may be ill-conditioned for small n_k)
-        #   α → 1: shared pooled covariance (LDA)
-        #   α = 0.5: balanced blend (default)
-        #
-        # Then ridge regularise the blend:
-        #   Σ_k_reg = (1-r)*Σ_k + r*I * mean(diag(Σ_k))
-        #
-        # This ensures positive-definiteness even when n_k < dim.
-        # Cholesky decomposition used for numerically stable inversion.
-        # Build training combined vectors once — reused for both
-        # Mahalanobis covariance estimation and FAISS index construction.
-
+        #   α → 0: full per-class QDA   α → 1: shared pooled (LDA)   α=0.5 blend
+        # Then ridge regularise:  Σ_k_reg = (1-r)*Σ_k + r*I*mean(diag(Σ_k))
+        # Cholesky used for stable inversion AND for the log-determinant that
+        # feeds the QDA volume term in _avm_proba.
         if self.mahalanobis:
             X_tr_c = _make_avm_combined(X_tr_n)   # AVM space for Mahal
-            D      = X_tr_c.shape[1]
+
+            # Per-column standardisation BEFORE covariance estimation. The
+            # combined AVM vector stacks branches on very different scales
+            # (boundary ∝ √F dominates tac∈tanh, cir∈[0,1]). Mahalanobis
+            # distance itself is invariant to a fixed diagonal rescale, but the
+            # ridge term (r·mean(diag)·I) and the RDA pooling are NOT — without
+            # this the ridge under-regularises the small-scale branches. Store
+            # the scale; apply the SAME standardisation to the query and the
+            # centroids inside _avm_proba.
+            self.avm_scale_ = X_tr_c.std(0).clip(min=1e-6).astype(np.float32)
+            X_tr_c = X_tr_c / self.avm_scale_
+
+            D = X_tr_c.shape[1]
 
             # Pooled covariance — weighted sum of per-class covariances
             S_pooled = np.zeros((D, D), dtype=np.float64)
@@ -900,21 +998,17 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                 S_pooled += (c.T @ c)
             S_pooled /= (len(X_tr_c) - K)   # unbiased pooled estimate
 
-            # Storage: (K*m, D, D) — one cov_inv per prototype.
-            # FIX: previously stored (K, D, D) and indexed by class only,
-            # giving every sub-prototype the same class-pooled covariance.
-            # That contradicts n_prototypes>1, where prototypes were spread
-            # by intra_sep to capture sub-clusters with DIFFERENT shapes.
-            # Now: each prototype gets its own RDA covariance estimated
-            # from the training points soft-assigned to it.
-            self.cov_inv_  = np.zeros((K * m, D, D), dtype=np.float32)
-            alpha          = float(self.mahal_alpha)
-            ridge          = float(self.mahal_reg)
+            # Storage: (K*m, D, D) cov_inv + (K*m,) log-determinants — one per
+            # prototype (n_prototypes>1 spreads prototypes via intra_sep to
+            # capture sub-clusters with DIFFERENT shapes, so each needs its own
+            # covariance estimated from its soft-assigned points).
+            self.cov_inv_    = np.zeros((K * m, D, D), dtype=np.float32)
+            self.cov_logdet_ = np.zeros(K * m, dtype=np.float32)
+            alpha            = float(self.mahal_alpha)
+            ridge            = float(self.mahal_reg)
 
-            # Build per-prototype soft assignments in normalised space.
-            # Use the actual learned prototype positions to weight points.
-            # For m=1, weights collapse to the class membership mask
-            # (single prototype gets all of its class's points).
+            # Soft assignments in normalised raw space use the learned prototype
+            # positions. For m=1 weights collapse to the class membership mask.
             X_tr_n_t = torch.tensor(X_tr_n, dtype=torch.float32)
 
             for i in range(K):
@@ -925,7 +1019,8 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                 if n_k < 2:
                     # Degenerate — replicate pooled to all m prototypes
                     for j in range(m):
-                        self.cov_inv_[i * m + j] = self._invert_cov(
+                        (self.cov_inv_[i * m + j],
+                         self.cov_logdet_[i * m + j]) = self._invert_cov(
                             S_pooled, ridge, D)
                     continue
 
@@ -934,7 +1029,8 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                     c   = cls_pts - cls_pts.mean(0, keepdims=True)
                     S_k = (c.T @ c) / (n_k - 1)
                     S_blend = (1.0 - alpha) * S_k + alpha * S_pooled
-                    self.cov_inv_[i] = self._invert_cov(S_blend, ridge, D)
+                    (self.cov_inv_[i],
+                     self.cov_logdet_[i]) = self._invert_cov(S_blend, ridge, D)
                 else:
                     # Per-prototype: soft-assign by distance in raw space,
                     # then weight covariance estimate accordingly.
@@ -957,15 +1053,18 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                         if ess > 1:
                             S_j *= ess / (ess - 1)
                         S_blend = (1.0 - alpha) * S_j + alpha * S_pooled
-                        self.cov_inv_[i * m + j] = self._invert_cov(
+                        (self.cov_inv_[i * m + j],
+                         self.cov_logdet_[i * m + j]) = self._invert_cov(
                             S_blend, ridge, D)
 
             if self.verbose:
                 print(f"  Mahalanobis: per-prototype RDA "
                       f"(alpha={alpha:.2f} ridge={ridge:.0e} "
-                      f"D={D} K*m={K*m})")
+                      f"D={D} K*m={K*m}, standardised + logdet)")
         else:
-            self.cov_inv_ = None
+            self.cov_inv_    = None
+            self.cov_logdet_ = None
+            self.avm_scale_  = None
 
         # ── KNN head ────────────────────────────────────────────────────
         self.active_heads_ = ['avm']
@@ -1006,32 +1105,37 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             self.index_           = index
             self.train_class_idx_ = y_tr.copy()
 
-            # Lambda selection — three modes
+            # Lambda selection. When extra heads (fisher/geodesic) are
+            # configured, _fit_fusion owns head combination and self.lambda_ is
+            # never read — skip the otherwise-dead scalar/gate search entirely.
+            extra_heads = bool(set(self.heads) & {'fisher', 'geodesic'})
+
             if self.entropy_lambda:
                 # AVM confidence gate — no training needed.
-                # lambda(x) = lam_confident - (lam_confident - lam_uncertain) * H(x)
-                # where H(x) = normalised entropy of AVM probability vector.
+                # lambda(x) = lam_confident - (lam_confident-lam_uncertain)*H(x)
                 # High AVM entropy (uncertain) → low lambda (trust KNN more).
-                # Low AVM entropy (confident)  → high lambda (trust AVM more).
                 self.lambda_ = None   # signals entropy gate in predict_proba
                 if self.verbose:
                     print(f"  lambda mode=entropy  "
                           f"confident={self.lam_confident}  "
                           f"uncertain={self.lam_uncertain}")
 
+            elif extra_heads:
+                self.lambda_ = self.lam_floor
+                if self.verbose:
+                    print("  lambda: skipped (extra heads → fusion owns "
+                          "head combination)")
+
             else:
-                # Lambda selection: compare scalar search vs confidence gate
-                # using the same AVM probabilities predict_proba produces.
+                # Compare scalar search vs confidence gate on the same AVM
+                # probabilities predict_proba produces.
                 X_va_avm = _make_avm_combined(X_va_n)
                 avm_val  = self._avm_proba(X_va_avm)
 
                 X_va_knn = _make_knn_combined(X_va_n)
                 knn_val  = self._knn_proba(X_va_knn)
 
-                # Option A — scalar grid search
-                # FIX: linspace instead of arange. np.arange with float step
-                # can miss the endpoint due to FP precision (lam=1.0 was
-                # sometimes excluded), losing pure-AVM as a candidate.
+                # Option A — scalar grid search (linspace keeps lam=1.0 in grid)
                 n_steps     = int(round((1.0 - self.lam_floor) / 0.05)) + 1
                 lam_grid    = np.linspace(self.lam_floor, 1.0, n_steps)
                 best_lam_f1, best_lam = -1.0, self.lam_floor
@@ -1043,7 +1147,7 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                         best_lam_f1 = f1
                         best_lam    = lam_c
 
-                # Option B — confidence-weighted gate (AVM+tri vs KNN)
+                # Option B — confidence-weighted gate (AVM vs KNN)
                 lam_conf, _ = self._lambda_gate(avm_val, knn_val)
                 p_conf      = lam_conf[:,None]*avm_val + (1-lam_conf[:,None])*knn_val
                 conf_f1 = self._val_score(y_va, p_conf.argmax(1))
@@ -1082,16 +1186,16 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                                  replace=False)
             else:
                 sub = np.arange(len(X_tr_n))
-            nn = max(2, min(self.geodesic_neighbors, len(sub) - 1))
+            nn_ = max(2, min(self.geodesic_neighbors, len(sub) - 1))
             nc = max(1, min(self.geodesic_components, n_feat))
-            self.geo_ = Isomap(n_neighbors=nn, n_components=nc).fit(X_tr_n[sub])
+            self.geo_ = Isomap(n_neighbors=nn_, n_components=nc).fit(X_tr_n[sub])
             emb = self.geo_.transform(X_tr_n).astype(np.float64)
             self.geo_centroids_ = np.stack(
                 [emb[y_tr == c].mean(0) if (y_tr == c).any()
                  else emb.mean(0) for c in range(K)])
             self.active_heads_.append('geodesic')
             if self.verbose:
-                print(f"  Geodesic head: Isomap nn={nn} dims={nc} "
+                print(f"  Geodesic head: Isomap nn={nn_} dims={nc} "
                       f"(fit on {len(sub)} pts)")
 
         # ── Fusion scheme ───────────────────────────────────────────────
@@ -1119,17 +1223,9 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
           proto[k, 1..]   = lowest-positive-margin training points in class k.
 
         Margin = d(nearest opposing class centroid) - d(own class centroid),
-        measured in Euclidean normalised space (proxy for AVM-space margin
-        at init — branch weights are not yet learned). Negative margins are
-        excluded (likely label noise — pulling a prototype to a mislabeled
-        point would corrupt the cluster shape). Falls back to jitter when
-        a class has too few points or too few positive-margin candidates.
-
-        Wave-interference reading: prototype 0 sits at the wave source,
-        prototype 1+ sit on the wave front where this class's intensity
-        equals the nearest opposing class's intensity. Multi-prototype
-        scoring then has explicit signal both for "deep inside the cluster"
-        (proto 0 close) and "at the frontier" (proto 1+ close).
+        measured in Euclidean normalised space. Negative margins are excluded
+        (likely label noise). Falls back to jitter when a class has too few
+        points or too few positive-margin candidates.
         """
         n_feat = X_tr_n.shape[1]
         class_means = np.stack([X_tr_n[y_tr == i].mean(0) for i in range(K)])
@@ -1138,10 +1234,7 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         if m == 1:
             return proto
 
-        # All-pairs distance: training points → class centroids.
-        # Norm-expansion ||x-c||^2 = ||x||^2 + ||c||^2 - 2 x.c^T avoids
-        # materialising the (N, K, F) difference tensor (which is ~GB at
-        # ArrivalType scale). clip(min=0) guards tiny negative round-off.
+        # All-pairs distance via norm-expansion (avoids the (N,K,F) tensor).
         d_all = np.sqrt(np.clip(
             (X_tr_n ** 2).sum(1, keepdims=True)
             + (class_means ** 2).sum(1)[None, :]
@@ -1154,7 +1247,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             n_k   = len(idx_k)
 
             if n_k < m:
-                # Degenerate class — jitter the remaining prototypes
                 proto[k, 1:] = class_means[k] + rng.normal(
                     0, 0.05, (m - 1, n_feat)).astype(np.float32)
                 fallback_classes.append(int(k))
@@ -1168,7 +1260,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             if pos.sum() >= m - 1:
                 cand_idx, cand_mgn = idx_k[pos], margin[pos]
             else:
-                # Too few positive-margin points — use all in-class points
                 cand_idx, cand_mgn = idx_k, margin
                 fallback_classes.append(int(k))
 
@@ -1189,70 +1280,129 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
 
     @staticmethod
     def _invert_cov(S, ridge, D):
-        """Ridge-regularise and Cholesky-invert a covariance matrix.
-        Cholesky is fast on well-conditioned matrices; on failure we escalate
-        the ridge (10x, up to 3x) and retry before paying for a pseudo-inverse,
-        which both recovers conditioning cheaply and avoids the dense pinv."""
+        """Ridge-regularise and Cholesky-invert a covariance matrix, returning
+        (Sigma_inv, log|Sigma|). The log-determinant is read off the Cholesky
+        factor (2·Σ log diag L) at no extra cost and feeds the QDA volume term
+        −0.5·log|Σ_k| in _avm_proba. Cholesky is fast on well-conditioned
+        matrices; on failure we escalate the ridge (10x, up to 3x) and retry
+        before paying for slogdet + pinv."""
         scale = np.diag(S).mean().clip(min=1e-10)
         r = float(ridge)
         for _ in range(3):
             S_reg = (1.0 - r) * S + r * scale * np.eye(D)
             try:
-                L     = np.linalg.cholesky(S_reg)
-                L_inv = np.linalg.solve(L, np.eye(D))
-                return (L_inv.T @ L_inv).astype(np.float32)
+                L      = np.linalg.cholesky(S_reg)
+                L_inv  = np.linalg.solve(L, np.eye(D))
+                logdet = 2.0 * np.log(np.diag(L)).sum()
+                return (L_inv.T @ L_inv).astype(np.float32), np.float32(logdet)
             except np.linalg.LinAlgError:
                 r = min(r * 10.0, 1.0)
-        # Last resort — pseudo-inverse of the most-regularised blend
-        S_reg = (1.0 - r) * S + r * scale * np.eye(D)
-        return np.linalg.pinv(S_reg).astype(np.float32)
+        # Last resort — pseudo-inverse + slogdet of the most-regularised blend
+        S_reg     = (1.0 - r) * S + r * scale * np.eye(D)
+        _, logdet = np.linalg.slogdet(S_reg)
+        return np.linalg.pinv(S_reg).astype(np.float32), np.float32(logdet)
 
     def _avm_proba(self, combined, batch_size=8192):
         """
-        Multi-prototype AVM scoring: per-class inverse-distance summed over
-        prototypes, then normalised. Per-prototype full Mahalanobis when
-        cov_inv_ is set.
+        QDA posterior over K classes, each an equal-weight mixture of its m
+        prototype Gaussians:
 
-        Processed in row-batches so peak memory is O(batch_size * D), not
-        O(N * D). The previous version cast all N rows to float64 at once and
-        held several (N, D) transients — multiple GB at ArrivalType scale.
-        (Vectorising the prototype loop via einsum would instead materialise a
-        (batch, K*m, D) tensor, which is worse on memory and no faster than the
-        BLAS matmul per prototype, so the prototype loop is retained.)
+            log p(k|x) = log π_k
+                       + logsumexp_{p∈k}[ −0.5·log|Σ_p| − 0.5·d²_M(x, c_p) ]
+                       + const   (−0.5·D·log 2π and −log m cancel in softmax_k)
+
+        then softmax over k. With cov_inv_ set, d²_M is the full per-prototype
+        Mahalanobis distance on STANDARDISED combined features (avm_scale_);
+        with cov_inv_ None it degenerates to −0.5·‖x−c‖² (identity-covariance /
+        spherical QDA). log|Σ_p| is the volume term the old inverse-distance
+        score dropped — without it large-covariance classes were systematically
+        over-predicted.
+
+        logdet_weight scales JUST the volume term (qda mode only):
+          1.0 = full QDA (statistically correct posterior).
+          0.0 = Mahalanobis distance + prior softmax, no volume term.
+        Distance and prior are untouched by the dial.
+
+        avm_score selects the decision form:
+          'qda'              softmax over the Gaussian discriminant above —
+                             sharp, light-tailed, statistically correct.
+          'inverse_distance' the original AVM vote Σ_p 1/d_M, renormalised —
+                             flat, heavy-tailed, better calibrated for the
+                             downstream entropy gates / fusion. Recovers the
+                             pre-QDA behaviour (on Mahalanobis distance); the
+                             volume term has no analogue here and is ignored.
+
+        prior_weight scales the empirical class prior in BOTH modes:
+          1.0 = full π_k (qda: +log π_k in the logit; invdist: ×π_k).
+          0.0 = no prior — raises minority recall / macro-F1 on imbalanced
+                data at the cost of strict posterior correctness.
+        The pre-QDA scoring is recovered with avm_score='inverse_distance',
+        prior_weight=0.0.
+
+        Centring note: the Gaussian component is centred on the LEARNED
+        prototype c_p (centroids_combined_); Σ_p was estimated about the soft-
+        assigned empirical mean. For m=1 these coincide; for m>1 (e.g. boundary-
+        init frontier prototypes) they differ by design — the prototype defines
+        where the component sits, Σ_p its shape.
+
+        Processed in row-batches so peak memory is O(batch_size·D).
         """
         K   = len(self.classes_)
         m   = self.n_prototypes_
         N   = combined.shape[0]
         P   = K * m
 
+        priors    = self._class_counts_ / self._class_counts_.sum()
+        log_prior = np.log(np.clip(priors, 1e-12, None))
+        pw        = float(getattr(self, 'prior_weight', 1.0))
+
+        # ── squared distance per prototype (Mahalanobis if cov else Euclidean)
+        #    + per-prototype volume offset (0 when no covariance) ─────────────
         if self.cov_inv_ is not None:
-            cov64  = self.cov_inv_.astype(np.float64)              # (P, D, D)
-            cen64  = self.centroids_combined_.astype(np.float64)   # (P, D)
-            d_flat = np.empty((N, P), dtype=np.float32)
+            scale  = self.avm_scale_.astype(np.float64)             # (D,)
+            cov64  = self.cov_inv_.astype(np.float64)               # (P, D, D)
+            cen64  = self.centroids_combined_.astype(np.float64) / scale  # (P,D)
+            w_ld   = float(getattr(self, 'logdet_weight', 1.0))     # volume dial
+            ld_eff = w_ld * self.cov_logdet_.astype(np.float64)     # (P,)
+            d2     = np.empty((N, P), dtype=np.float64)
             for s in range(0, N, batch_size):
                 e     = min(s + batch_size, N)
-                chunk = combined[s:e].astype(np.float64)           # (B, D)
+                chunk = combined[s:e].astype(np.float64) / scale    # (B, D) std
                 for p in range(P):
-                    diff = chunk - cen64[p]                        # (B, D)
-                    tmp  = diff @ cov64[p]                         # (B, D)
-                    d_flat[s:e, p] = np.sqrt(
-                        np.maximum((tmp * diff).sum(1), 0.0))
+                    diff = chunk - cen64[p]                         # (B, D)
+                    tmp  = diff @ cov64[p]                          # (B, D)
+                    d2[s:e, p] = np.maximum((tmp * diff).sum(1), 0.0)
         else:
             a_sq   = (combined ** 2).sum(1, keepdims=True)
             b_sq   = (self.centroids_combined_ ** 2).sum(1)
             ab     = combined @ self.centroids_combined_.T
-            d_flat = np.sqrt(np.maximum(
-                a_sq + b_sq[None, :] - 2.0 * ab, 0.0)).astype(np.float32)
+            d2     = np.maximum(a_sq + b_sq[None, :] - 2.0 * ab, 0.0)
+            ld_eff = np.zeros(P, dtype=np.float64)
 
-        d_km  = d_flat.reshape(N, K, m)
-        raw   = (1.0 / (d_km + 1e-10)).sum(2)
-        return raw / raw.sum(1, keepdims=True)
+        # ── decision form ──────────────────────────────────────────────────
+        if getattr(self, 'avm_score', 'qda') == 'inverse_distance':
+            # Heavy-tailed inverse-distance vote over prototypes (the original
+            # AVM form), now on the Mahalanobis distance. Flat, well-calibrated
+            # for the downstream entropy gates. logdet_weight has no clean
+            # analogue here and is ignored; prior_weight applies as π_k^pw.
+            d_km = np.sqrt(d2).reshape(N, K, m)
+            raw  = (1.0 / (d_km + 1e-10)).sum(2)                    # (N, K)
+            if pw != 0.0:
+                raw = raw * (priors[None, :] ** pw)
+            return (raw / raw.sum(1, keepdims=True)).astype(np.float32)
+
+        # QDA posterior — equal-weight prototype mixture, prior in the logit.
+        log_comp = (-0.5 * (d2 + ld_eff[None, :])).reshape(N, K, m)
+        cmax = log_comp.max(2)                                      # (N, K)
+        lse  = cmax + np.log(np.exp(log_comp - cmax[..., None]).sum(2))
+        logits = lse + pw * log_prior[None, :]                      # (N, K)
+        logits -= logits.max(1, keepdims=True)
+        e = np.exp(logits)
+        return (e / e.sum(1, keepdims=True)).astype(np.float32)
 
     def _knn_proba(self, combined, search_batch=50_000):
         """
-        KNN inverse-distance vote.
-        Vectorized scatter — avoids np.add.at overhead.
-        Loop over k neighbours (k=5..10) is cheap; avoids O(N*k) Python calls.
+        KNN inverse-distance vote. Vectorized scatter.
         """
         if self.index_ is None:
             raise RuntimeError("FAISS index not built.")
@@ -1327,13 +1477,9 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
 
     def _fit_fusion(self, P_val, y_va, floor=0.05, shrink=0.5, margin=1e-3):
         """Pick N-head fusion on validation, regularised against overfitting a
-        small/imbalanced val split:
-          - static weights from coordinate ascent are floored (no head can be
-            zeroed) and shrunk toward uniform,
-          - selection only departs from uniform when it clears a margin, and
-            prefers the parameter-free confidence gate over fitted weights.
-        On a tiny imbalanced val (e.g. a 4% class with ~7 samples) the raw
-        argmax-of-val search would otherwise chase noise and zero out a head."""
+        small/imbalanced val split: floored + shrunk static weights, departing
+        from uniform only past a margin, preferring the parameter-free
+        confidence gate over fitted weights."""
         heads = self.active_heads_
         probs = [P_val[h] for h in heads]
         n = len(heads)
@@ -1358,7 +1504,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
                     if sc > cur:
                         cur, cur_w = sc, cand
                 w, best = cur_w, cur
-        # shrink fitted weights toward uniform to temper val overfitting
         static_w  = (1.0 - shrink) * w + shrink * uni
         static_f1 = score(static_w)
 
@@ -1367,8 +1512,7 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         p_conf  = sum(W[:, i:i+1] * probs[i] for i in range(n))
         conf_f1 = self._val_score(y_va, p_conf.argmax(1))
 
-        # robustness-ordered selection: uniform < confidence < static,
-        # only moving up when the gain clears `margin`.
+        # robustness-ordered selection: uniform < confidence < static
         mode, mode_f1 = 'uniform', uni_f1
         if conf_f1 > mode_f1 + margin:
             mode, mode_f1 = 'confidence', conf_f1
@@ -1393,14 +1537,12 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         W = self._conf_weights(probs)                      # confidence
         return sum(W[:, i:i+1] * probs[i] for i in range(len(heads)))
 
-
     def _apply_gravity(self, proba):
-        """Decision-stage class-prior reweight ('centroid gravity'):
+        """Decision-stage prior tempering ('centroid gravity'):
         p'(k|x) ∝ p(k|x) · π_k^α, i.e. log p + α·log π_k, renormalised.
-        α = prior_temp: 0 = no gravity (default, unchanged), 1 = full empirical
-        prior, between = tempered. Applied post-fusion / pre-decision so it
-        reshapes the decision without corrupting the head likelihoods, and so
-        α can be swept on a single fit."""
+        With the QDA prior now built into _avm_proba, this TEMPERS that prior
+        rather than adding a second one — keep prior_temp=0 (default) for a
+        single, correctly-weighted prior; >0 deliberately over-weights it."""
         a = float(getattr(self, 'prior_temp', 0.0))
         if a == 0.0:
             return proba
@@ -1481,11 +1623,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
     def class_distribution(self, as_dict=False):
         """
         Training class distribution as percentages.
-        Parameters
-        ----------
-        as_dict : bool
-            If True return {class_label: pct}. If False return a
-            formatted string like "0: 4%  1: 82%  2: 14%".
         """
         check_is_fitted(self, 'classes_')
         counts = getattr(self, '_class_counts_', None)
@@ -1498,6 +1635,88 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
         return "  ".join(
             f"{c}: {n/total*100:.0f}%"
             for c, n in zip(self.classes_, counts))
+
+    def report(self, X, y, as_dict=False):
+        """
+        Per-class precision / recall / F1 / support + confusion matrix from the
+        fitted model — the targeted diagnostic for an imbalanced squeeze (shows
+        exactly which class is dragging macro-F1, e.g. a minority class with
+        high precision but floored recall).
+
+        All metrics are derived from a single confusion matrix (one predict
+        pass), matching _val_score. Rows of the printed matrix are TRUE classes,
+        columns are PREDICTED; the lowest-F1 class is flagged.
+
+        as_dict=True returns
+          {'per_class': {label: {'precision','recall','f1','support'}},
+           'accuracy', 'macro_f1', 'weighted_f1',
+           'confusion': ndarray (K,K), 'labels': classes_}
+        """
+        from sklearn.metrics import confusion_matrix
+        check_is_fitted(self, 'centroids_combined_')
+        y_pred = self.predict(np.asarray(X, dtype=np.float32))
+        y_true = np.asarray(y)
+
+        labels = self.classes_
+        K      = len(labels)
+        cm     = confusion_matrix(y_true, y_pred, labels=labels).astype(float)
+        tp     = np.diag(cm)
+        support = cm.sum(1)          # true count per class
+        pred_s  = cm.sum(0)          # predicted count per class
+        total   = cm.sum()
+
+        prec = np.zeros(K); rec = np.zeros(K); f1 = np.zeros(K)
+        np.divide(tp, pred_s, out=prec, where=pred_s > 0)
+        np.divide(tp, support, out=rec, where=support > 0)
+        denom = prec + rec
+        np.divide(2 * prec * rec, denom, out=f1, where=denom > 0)
+
+        acc      = tp.sum() / (total + 1e-10)
+        macro    = f1.mean()
+        weighted = (f1 * support).sum() / (total + 1e-10)
+
+        if as_dict:
+            return {
+                'per_class': {
+                    labels[i]: {'precision': float(prec[i]),
+                                'recall':    float(rec[i]),
+                                'f1':        float(f1[i]),
+                                'support':   int(support[i])}
+                    for i in range(K)},
+                'accuracy':    float(acc),
+                'macro_f1':    float(macro),
+                'weighted_f1': float(weighted),
+                'confusion':   cm.astype(int),
+                'labels':      labels,
+            }
+
+        worst = int(np.argmin(f1))
+        lab_w = max(8, max(len(str(c)) for c in labels))
+        lines = [
+            f"  {'class':<{lab_w}}  prec    recall  f1      support",
+            f"  {'-'*lab_w}  ------  ------  ------  -------",
+        ]
+        for i in range(K):
+            flag = "  ← lowest F1" if i == worst and K > 1 else ""
+            lines.append(
+                f"  {str(labels[i]):<{lab_w}}  {prec[i]:.4f}  {rec[i]:.4f}"
+                f"  {f1[i]:.4f}  {int(support[i]):>7d}{flag}")
+        lines += [
+            f"  {'-'*lab_w}  ------  ------  ------  -------",
+            f"  {'accuracy':<{lab_w}}                  {acc:.4f}  {int(total):>7d}",
+            f"  {'macro':<{lab_w}}                  {macro:.4f}",
+            f"  {'weighted':<{lab_w}}                  {weighted:.4f}",
+            "",
+            "  Confusion (rows=true, cols=pred):",
+        ]
+        cell = max(6, max(len(str(c)) for c in labels) + 1)
+        header = " " * (lab_w + 4) + "".join(
+            f"{str(c):>{cell}}" for c in labels)
+        lines.append(header)
+        for i in range(K):
+            row = "".join(f"{int(cm[i, j]):>{cell}d}" for j in range(K))
+            lines.append(f"  {str(labels[i]):<{lab_w}}  {row}")
+        return "\n".join(lines)
 
     def summary(self, feature_names=None):
         """Print a human-readable model summary after fitting."""
@@ -1521,11 +1740,15 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             f"  Train / val  : {n_tr} / {n_va}",
             "",
             f"  Lambda  : {lam_str}",
-            f"  Tau     : {tau_str}",
+            f"  Tau     : {tau_str}  (training-only)",
             f"  Val F1  : {getattr(self, 'best_val_f1_', float('nan')):.4f}",
             "",
-            f"  Mahalanobis : {'full RDA' if self.mahalanobis else 'off'}"
+            f"  Discriminant: QDA posterior (log π_k − 0.5·log|Σ_k| − 0.5·d²_M)",
+            f"  AVM score   : {self.avm_score}  prior_weight={self.prior_weight}",
+            f"  Mahalanobis : {'full RDA (standardised)' if self.mahalanobis else 'off (spherical QDA)'}"
             f"  (alpha={self.mahal_alpha}  ridge={self.mahal_reg:.0e})",
+            f"  Logdet wt   : {self.logdet_weight}  (1=full QDA volume term, 0=distance+prior)",
+            f"  Prior temp  : {self.prior_temp}  (0 = single built-in prior)",
             f"  Ordinal EMD : {self.ordinal}  (weight={self.ordinal_weight})",
             f"  SupCon      : {self.supcon}"
             f"  (weight={self.supcon_weight}  temp={self.supcon_temp})",
@@ -1569,7 +1792,6 @@ class LearningAVNN(BaseEstimator, ClassifierMixin):
             for cls, v in zip(self.classes_, self.centroid_drift_):
                 bar = "█" * int(v * 40)
                 lines.append(f"    class {cls}: {v:.4f}  {bar}")
-            # Per-prototype drift when m > 1 — useful for boundary-init A/B
             per_proto = getattr(self, 'centroid_drift_per_proto_', None)
             if per_proto is not None and per_proto.shape[1] > 1:
                 lines.append("  Per-prototype drift:")
