@@ -1,225 +1,159 @@
-# AVNN Model Family — Benchmark Comparison
+# LearningAVNN — Benchmark Comparison
 
-All AVNN results use 5-fold stratified CV on small/medium datasets.  
-ArrivalType uses a single stratified holdout (80/20) with 200k training subsample.  
-Popular model results use the same 5-fold CV protocol with default sklearn parameters.  
-Macro F1 is the primary metric for imbalanced datasets (Red/White Wine, ArrivalType).
+Macro-F1 is the primary metric for imbalanced datasets; accuracy/weighted-F1 are
+reported for context.
 
----
+## Protocol & provenance (read first)
 
-## Iris — 150 samples, 4 features, 3 balanced classes
+Three tiers of number appear below, kept separate on purpose:
 
-| Model | Accuracy | Macro F1 | Weighted F1 |
-|-------|----------|----------|-------------|
-| **TriAnchorAVNN** | **0.9467** | **0.9466** | **0.9466** |
-| FastTriBranchAVNN | 0.9467 | 0.9465 | 0.9465 |
-| BranchAdaptiveAVNN (learnable) | 0.9600 | 0.9598 | 0.9598 |
-| AVNNClassifier (static) | 0.9533 | 0.9532 | 0.9532 |
-| KNN k=5 + StandardScaler | 0.9733 | 0.9733 | 0.9733 |
-| KNN k=5 + MinMax [-1,1] | 0.9599 | 0.9599 | 0.9599 |
-| Random Forest (100 trees) | 0.9467 | 0.9464 | 0.9464 |
-| XGBoost (default) | 0.9400 | 0.9389 | 0.9389 |
-| SVM RBF | 0.9667 | 0.9665 | 0.9665 |
-| Logistic Regression | 0.9667 | 0.9665 | 0.9665 |
+- **LearningAVNN (current)** — the model in this repo, most recent run. 5-fold
+  stratified CV on small/medium sets. These are the doc-7 results.
+- **Tree baseline (measured here)** — `HistGradientBoostingClassifier`
+  (`class_weight='balanced'`, early stopping), 5-fold stratified, `seed=42`.
+  Run only on the datasets that ship with sklearn (Iris, Wine, Breast Cancer).
+  These use a *different* fold seed than the LearningAVNN runs, so treat ±0.01 as
+  noise; the controlled, identical-fold comparison is `bench_avnn_vs_tree.py`.
+- **External (prior internal runs)** — XGBoost / RF / SVM / LogReg numbers for the
+  wine-quality and ArrivalType sets, carried over from earlier internal CV. These
+  have **not** yet been re-run on matched folds against the current model; the
+  harness does that.
 
----
-
-## Wine (Cultivar) — 178 samples, 13 features, 3 balanced classes
-
-| Model | Accuracy | Macro F1 | Weighted F1 |
-|-------|----------|----------|-------------|
-| **FastTriBranchAVNN** | **0.9887** | **0.9884** | **0.9888** |
-| TriAnchorAVNN | 0.9830 | 0.9831 | 0.9829 |
-| BranchAdaptiveAVNN (learnable) | 0.9830 | 0.9831 | 0.9829 |
-| AVNNClassifier (static) | 0.9775 | 0.9777 | 0.9771 |
-| KNN k=5 + StandardScaler | 0.9721 | 0.9721 | 0.9721 |
-| KNN k=5 + MinMax [-1,1] | 0.9612 | 0.9612 | 0.9612 |
-| Random Forest (100 trees) | 0.9775 | 0.9784 | 0.9775 |
-| XGBoost (default) | 0.9606 | 0.9608 | 0.9604 |
-| SVM RBF | 0.6744 | 0.6247 | 0.6484 |
-| Logistic Regression | 0.9497 | 0.9523 | 0.9495 |
-
-> Note: SVM RBF collapses on Wine without feature scaling — confirms the value of built-in normalisation.
+> **Binning caveat (White Wine).** The current runs bin white-wine quality as
+> {3,4,5}/{6}/{7,8,9} → ~33/45/22. Earlier family benchmarks used a different
+> binning (~4/75/22). White-wine macro-F1 across the two is therefore **not**
+> directly comparable. Red Wine binning ({3,4}/{5,6}/{7,8} → ~4/82/14) is
+> consistent.
 
 ---
 
-## Breast Cancer — 569 samples, 30 features, 2 classes
+## Reachable sets — LearningAVNN vs a real gradient-boosted tree
 
-| Model | Accuracy | Macro F1 | Weighted F1 |
-|-------|----------|----------|-------------|
-| **BranchAdaptiveAVNN (learnable)** | **0.9683** | **0.9655** | **0.9680** |
-| TriAnchorAVNN | 0.9543 | 0.9506 | 0.9541 |
-| FastTriBranchAVNN | 0.9350 | 0.9305 | 0.9350 |
-| AVNNClassifier (static) | 0.9649 | 0.9616 | 0.9645 |
-| KNN k=5 + StandardScaler | — | — | — |
-| Random Forest (100 trees) | 0.9561 | 0.9529 | 0.9560 |
-| XGBoost (default) | 0.9526 | 0.9491 | 0.9524 |
-| SVM RBF | 0.9139 | 0.9035 | 0.9115 |
-| Logistic Regression | 0.9473 | 0.9430 | 0.9470 |
+These three I could run a tree on directly. The point: a gradient-boosted tree is
+the canonical interaction-modelling method, so if it can't beat LearningAVNN here,
+there's no interaction headroom the geometric model is leaving on the table.
 
-> TriAnchorAVNN's magnitude branch (`arccos(|x|)`) recovered most of the gap vs FastTriBranchAVNN on this 30-feature dataset.
+| Dataset | LearningAVNN macro | Tree (HGB) macro | Verdict |
+|---------|--------------------|------------------|---------|
+| Iris (150, 4f, balanced) | 0.9598 | 0.9666 | Tie — both at ceiling |
+| Wine (178, 13f, balanced) | **0.9944** | 0.9565 | AVNN wins by ~3.8 pts |
+| Breast Cancer (569, 30f, 37/63) | **0.9634** | 0.9493 | AVNN wins by ~1.4 pts |
 
----
-
-## Red Wine Quality — 1,599 samples, 11 features, 3 imbalanced classes
-*Class distribution: ~4% low / ~83% medium / ~13% high quality*
-
-| Model | Accuracy | Macro F1 | Weighted F1 | Notes |
-|-------|----------|----------|-------------|-------|
-| **TriAnchorAVNN** (gravity=0.5) | 0.8130 | **0.5967** | 0.8281 | Macro F1 priority |
-| TriAnchorAVNN (gravity=0.0) | 0.8537 | 0.5885 | 0.8485 | Accuracy priority |
-| FastTriBranchAVNN | 0.8499 | 0.5979 | 0.8454 | |
-| BranchAdaptiveAVNN (learnable) | 0.8236 | 0.5753 | 0.8265 | |
-| AVNNClassifier (static) | 0.8587 | 0.5314 | 0.8430 | |
-| Random Forest (100 trees) | 0.8599 | 0.5326 | 0.8416 | |
-| XGBoost (default) | 0.8487 | 0.5267 | 0.8340 | |
-| SVM RBF | 0.8249 | 0.3013 | 0.7457 | Collapses on imbalance |
-| Logistic Regression | 0.8355 | 0.4253 | 0.7955 | |
-
-> On macro F1 (the fair metric for imbalanced data), **AVNN variants outperform all popular models**. SVM and Logistic Regression fail severely.
+On every reachable set, the tree ties (Iris) or loses (Wine, Breast Cancer). Wine
+is a pure covariance/Gaussian-structure problem where the QDA work pays and trees
+have nothing to add; on Breast Cancer the interaction-native method can't match the
+per-prototype Mahalanobis. No reachable dataset shows interaction headroom AVNN is
+missing.
 
 ---
 
-## White Wine Quality — 4,898 samples, 11 features, 3 imbalanced classes
-*Class distribution: ~4% low / ~75% medium / ~22% high quality*
+## Imbalanced sets — current LearningAVNN
 
-| Model | Accuracy | Macro F1 | Weighted F1 | Notes |
-|-------|----------|----------|-------------|-------|
-| **TriAnchorAVNN** (gravity=0.5) | 0.8071 | **0.6390** | 0.8122 | Macro F1 priority |
-| TriAnchorAVNN (gravity=0.0) | 0.8258 | 0.6351 | 0.8216 | |
-| FastTriBranchAVNN | 0.8242 | 0.6364 | 0.8209 | |
-| BranchAdaptiveAVNN (learnable) | 0.8167 | 0.6173 | 0.8100 | |
-| AVNNClassifier (static) | 0.8365 | 0.6194 | 0.8267 | |
-| Random Forest (100 trees) | 0.8514 | 0.6307 | 0.8363 | |
-| XGBoost (default) | 0.8340 | **0.6384** | 0.8232 | Near-tie on macro F1 |
-| SVM RBF | 0.7462 | 0.2849 | 0.6378 | Collapses |
-| Logistic Regression | 0.7656 | 0.4265 | 0.7190 | |
+| Dataset | Accuracy | Macro F1 | Weighted F1 | Config note |
+|---------|----------|----------|-------------|-------------|
+| Red Wine (1599, 11f, ~4/82/14) | 0.8199 | **0.5953** | 0.8264 | `inverse_distance`, `prior_weight=0`, `weight_cap=2`, `val_macro_bias=0.85`, m=2 |
+| White Wine (4898, 11f, ~33/45/22) | 0.6978 | **0.6950** | 0.6977 | `inverse_distance`, `prior_weight=0`, m=3 |
 
----
+Macro-F1 here is gated by minority recall. The tuning that moved Red Wine — pushing
+`val_macro_bias` to 0.85 and `weight_cap` to 2 (a *gentle* reweight; harder reweights
+overcorrect on its ~44-sample minority) — is the lever, alongside `prior_weight=0`
+to stop the class prior burying the rare class.
 
-## ArrivalType — Oil & Gas (434,163 test samples, 20 features, 4 imbalanced classes)
-*Class distribution: ~0.4% / ~3.3% / ~0.4% / ~95.8%*  
-*Single holdout split, 200k stratified training subsample*
+### External baselines on the imbalanced sets (prior internal runs — pending controlled rerun)
 
-| Model | Accuracy | Macro F1 | Weighted F1 | Fit Time | Predict Time |
-|-------|----------|----------|-------------|----------|--------------|
-| **TriAnchorAVNN** (gravity=0.5) | 0.9636 | **0.5794** | 0.9592 | ~7s | ~8s |
-| TriAnchorAVNN (gravity=0.0) | 0.9649 | 0.5732 | 0.9597 | ~7s | ~8s |
-| FastTriBranchAVNN | 0.9649 | 0.5745 | 0.9597 | 7.5s | 5.6s |
-| BranchAdaptiveFastAVNN | 0.9641 | 0.5668 | 0.9585 | 104s | 6.3s |
+| Model | Red Wine macro | White Wine macro† |
+|-------|----------------|-------------------|
+| **LearningAVNN (current)** | **0.5953** | **0.6950** |
+| XGBoost (default) | 0.527 | 0.638 |
+| Random Forest (100) | 0.533 | 0.631 |
+| Logistic Regression | 0.425 | 0.427 |
+| SVM RBF | 0.301 | 0.285 |
 
-> Fit time includes FAISS IVF index construction on 200k samples.  
-> Predict time includes scoring 434k test points.  
-> Popular models not benchmarked on this proprietary dataset.
+†White Wine external numbers use the older ~4/75/22 binning — **not** comparable to
+the current 0.6950 (different problem). Re-run with `bench_avnn_vs_tree.py` for a
+matched comparison. On Red Wine (consistent binning), AVNN leads the field on macro;
+SVM/LogReg collapse on imbalance without manual tuning.
 
----
+### ArrivalType — Oil & Gas (proprietary, not re-run here)
 
-## Model Family Summary
-
-| Model | Training | Inference | FAISS | Gravity | Best For |
-|-------|----------|-----------|-------|---------|----------|
-| `AVNNClassifier` | None | O(n·F) | No | No | Fast baseline, small data |
-| `BranchAdaptiveAVNN` | PyTorch (slow) | O(n·F) | No | No | Research, max accuracy |
-| `FastTriBranchAVNN` | None | O(k·log n) | Yes | No | Large balanced datasets |
-| `TriAnchorAVNN` | None | O(k·log n) | Yes | Optional | Large imbalanced datasets |
+Prior family result: ~0.58 macro-F1 at ~7s fit on a 200k subsample (training scales
+with K, not N). The current LearningAVNN has not been run on ArrivalType in this
+cycle (CSV absent from the test harness). This is the dataset where the QDA prior
+may actually help — with ~87k minority rows the covariance and prior are
+well-estimated, unlike the tiny wine minorities — so it warrants its own
+`avm_score` / `prior_weight` sweep rather than inheriting the wine settings.
 
 ---
 
-## Key Findings
+## Key findings
 
-**AVNN advantages over popular models:**
-- Outperforms Random Forest and XGBoost on macro F1 for imbalanced classification (Red Wine, White Wine, ArrivalType)
-- No hyperparameter search required — geometric defaults work across datasets
-- SVM collapses without careful scaling; AVNN's built-in MinMax normalisation handles this automatically
-- Sub-10-second fit and predict on 600k+ samples via FAISS
-
-**When popular models win:**
-- KNN + StandardScaler leads on Iris (0.9733 vs 0.9467) — StandardScaler variance normalisation benefits simple 4-feature problems
-- XGBoost nearly matches on White Wine macro F1 (0.6384 vs 0.6390) — boosting captures non-geometric interactions
-
-**Gravity parameter:**
-- `gravity=0.0` — maximise accuracy and weighted F1 (deployment where distribution is all that matters)
-- `gravity=0.3-0.5` — maximise macro F1 / minority class detection (deployment where rare events matter)
-- Symmetric cap at `gravity_cap=1.5` prevents majority class suppression while still boosting minority classes
-
----
-
-*Evaluation protocol: 5-fold stratified CV, `random_state=42`, default parameters unless noted.  
-Popular model benchmarks reproduced from internal CV runs using sklearn defaults.*
+- **Trees reveal no interaction headroom on any reachable set.** AVNN ties on Iris
+  and beats gradient-boosted trees on Wine and Breast Cancer. The interaction probe
+  (`'interaction'` KNN branch) produced only small, consistent positive nudges
+  (largest on the 30-feature Breast Cancer set, +0.0037 macro) — real, but not the
+  tip of a missed-structure iceberg.
+- **AVNN's edge is on imbalance and shape.** Where classes are correlated Gaussian
+  blobs (Wine) or need shape-aware distance (Breast Cancer), the per-prototype
+  Mahalanobis beats trees. Where minority recall is the bottleneck (Red Wine), the
+  built-in class-balanced objective beats SVM/LogReg outright.
+- **No per-dataset hyperparameter search required for the geometry** — defaults
+  generalise; the imbalance levers (`weight_cap`, `val_macro_bias`, `prior_weight`)
+  are the ones worth tuning, and they scale with how many minority samples exist.
+- **The wine ceiling looks like noise, not missing structure** on the reachable
+  evidence. The decisive test is the wine-quality tree row in
+  `bench_avnn_vs_tree.py`: tree clearly above AVNN → real interaction signal, build
+  the free-coordinate head; tree at/below AVNN → at the data's Bayes ceiling.
 
 ---
 
-## Computational Performance
+## AVNN family (historical context)
 
-### Key characteristics
+LearningAVNN is the PyTorch *learnable* lineage (listed as "BranchAdaptiveAVNN
+(learnable)" in earlier benchmarks). Sibling implementations traded training for
+speed:
 
-| Property | AutoLambdaAVNN | XGBoost / LightGBM | Deep learning (MLP/TabNet) |
-|----------|---------------|-------------------|---------------------------|
-| Learnable parameters | ~20 | N/A (trees) | 10k – 1M+ |
-| Training scales with | K (# classes) | N (# samples) | N (# samples) |
-| Inference scales with | log N (FAISS IVF) | O(trees × depth) | O(N × layers) |
-| Imbalance handling | Built-in (gravity, ordinal, weighted NLL) | Requires SMOTE or `scale_pos_weight` | Requires class weights or oversampling |
-| Interpretability | Feature weights, branch weights, tau per class | SHAP post-hoc | SHAP post-hoc, limited |
-| Hyperparameter sensitivity | Low — geometric defaults generalise | High — n_estimators, depth, lr, subsample | Very high |
+| Variant | Training | Inference | FAISS | Best for |
+|---------|----------|-----------|-------|----------|
+| `AVNNClassifier` (static) | none | O(n·F) | no | fast baseline, small data |
+| `LearningAVNN` (this repo) | PyTorch | O(K·m) score | optional | research, max accuracy, imbalance |
+| `FastTriBranchAVNN` | none | O(k·log n) | yes | large balanced datasets |
+| `TriAnchorAVNN` | none | O(k·log n) | yes | large imbalanced datasets |
 
-### Fit time — small dataset (~1,500 samples)
+Earlier family results referenced explicit "triangle"/"bilinear" pairwise scorers
+and a post-hoc "gravity" prior. Both are superseded in the current model: the
+per-prototype precision matrix's off-diagonals *are* the learned pairwise
+interactions, and the class prior now lives inside the QDA score (`prior_weight`),
+with `prior_temp` retained only as an optional post-fusion gravity (default 0).
 
-| Model | Approx. fit time |
-|-------|----------------|
-| LightGBM | ~0.2s |
-| XGBoost | ~0.3s |
-| sklearn MLP | ~2s |
-| **AutoLambdaAVNN** | **~8–15s** |
+---
 
-XGBoost wins on small data. AutoLambdaAVNN trains ~90 epochs × 5 mini-batches — overhead is real at this scale.
+## Computational characteristics
 
-### Fit time — large dataset (200k samples)
+| Property | LearningAVNN | XGBoost / LightGBM | Deep nets (MLP/TabNet) |
+|----------|--------------|--------------------|------------------------|
+| Core learnable parameters | tens (branch/feature gates, τ) + K·m·F prototypes | N/A (trees) | 10k – 1M+ |
+| Training scales with | K (centroids), not N | N | N |
+| Inference scales with | K·m (AVM) + log N (FAISS KNN) | trees × depth | N × layers |
+| Imbalance handling | built-in (balanced NLL, ordinal EMD, macro-biased selection, prior dials) | needs SMOTE / `scale_pos_weight` | needs class weights / oversampling |
+| Interpretability | feature & branch weights, τ, per-class covariance, `report()` | SHAP post-hoc | SHAP, limited |
+| Hyperparameter sensitivity | low — geometric defaults generalise | high | very high |
 
-| Model | Approx. fit time |
-|-------|----------------|
-| LightGBM | ~5s |
-| **AutoLambdaAVNN** | **~7s** (measured on ArrivalType) |
-| XGBoost | ~20s |
-| sklearn MLP | ~35s |
-| Deep learning | ~180s+ |
-
-AutoLambdaAVNN's training is O(K) not O(N) — each epoch trains against K centroids, not 200k points. The FAISS index build is the only step that touches all N. This is a structural advantage at scale that grows as N increases.
-
-### Macro F1 on imbalanced datasets
-
-| Model | Red Wine | White Wine | ArrivalType |
-|-------|----------|------------|-------------|
-| SVM RBF | 0.30 | 0.28 | — |
-| Logistic Regression | 0.43 | 0.43 | — |
-| Random Forest | 0.53 | 0.63 | — |
-| XGBoost | 0.53 | 0.64 | 0.57 |
-| **AutoLambdaAVNN** | **0.60** | **0.64** | **0.58** |
-
-On macro F1 for imbalanced classification, AVNN matches or beats XGBoost without any manual imbalance tuning.
-
-### When to use each model
-
-**Use XGBoost when:**
-- Dataset is small and balanced
-- Fit speed is critical
-- You need maximum raw accuracy
-- Feature interactions are complex and non-geometric
-
-**Use AutoLambdaAVNN when:**
-- Dataset is imbalanced and minority class detection matters
-- You want interpretable geometric feature weights
-- Dataset is large (training O(K) advantage grows with N)
-- You want macro F1 optimisation built into the training objective
-
-**Use deep learning when:**
-- Dataset is very large (millions of samples) and high-dimensional
-- GPU is available
-- You have time to tune and enough data to justify the parameter count
+Approximate fit time: trees win on small data (XGBoost ~0.3s vs AVNN ~8–15s — the
+~90 epochs × 5 mini-batches overhead is real at that scale). At 200k samples the
+O(K) training flips the order (AVNN ~7s, the FAISS index build being the only step
+touching all N).
 
 ### Honest limitations
 
-- AutoLambdaAVNN is 30–50x slower than XGBoost on small datasets
-- Per-epoch cost is low but epoch count (50–200) adds up
-- No GPU support currently — all PyTorch ops run on CPU
-- FAISS IVF requires minimum sample count for index training
-- Does not handle categorical features natively (requires encoding)
+- 30–50× slower than XGBoost on small datasets; epoch count dominates.
+- CPU-only today (no GPU path).
+- FAISS IVF needs a minimum sample count to train the index (flat fallback below it).
+- No native categorical handling (requires encoding).
+- The QDA volume term can be unstable at high D / low n — hence the `logdet_weight`
+  dial; on tiny minorities the prior hurts macro-F1, hence `prior_weight`.
+
+---
+
+*Reproduce the controlled comparison with `bench_avnn_vs_tree.py` (identical folds,
+both models, all five datasets). External baselines marked "prior internal runs"
+have not yet been re-run on matched folds against the current model.*
