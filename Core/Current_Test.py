@@ -29,7 +29,7 @@ except Exception:
 
 # Enriched KNN branch set: originals + monotone views (log, rank).
 # Add 'clr' only for genuinely compositional features.
-ENRICHED_KNN = ('linear', 'shape', 'quadratic', 'log', 'rank')
+ENRICHED_KNN = ('linear', 'shape', 'quadratic', 'log', 'rank', 'interaction')
 
 # ----------------------------------------------------------------------
 # Helper: cross-validation for small/medium datasets
@@ -180,7 +180,9 @@ def main():
         'ordinal_weight': 0.5,
         'supcon': True,
         'ema_centroids': False,
-        'val_macro_bias': 0.7,
+        'val_macro_bias': 0.7,        
+        'avm_score': 'inverse_distance',
+        'prior_weight': 0.0,
         'heads': ('avm', 'knn', 'fisher'),
         'knn_branches': ENRICHED_KNN,
     })
@@ -200,10 +202,13 @@ def main():
         kw.update({
             'ordinal': True,
             'ordinal_weight': 0.5,
+            'weight_cap': 2,
             'supcon': True,
             'ema_centroids': True,
             'n_prototypes': 2,
-            'val_macro_bias': 0.8,
+            'val_macro_bias': 0.85,
+            'avm_score': 'inverse_distance',
+            'prior_weight': 0.0,
             'heads': ('avm', 'knn'),
             'knn_branches': ENRICHED_KNN,
             # NOTE: intra_sep is now a live gradient (was inert). Re-sweep it
@@ -227,9 +232,12 @@ def main():
             'ordinal': True,
             'ordinal_weight': 0.5,
             'supcon': True,
+            'weight_cap': 2.5,
             'ema_centroids': True,
-            'n_prototypes': 1,
-            'val_macro_bias': 0.7,
+            'n_prototypes': 3,
+            'val_macro_bias': 0.85,            
+            'avm_score': 'inverse_distance',
+            'prior_weight': 0.0,
             'heads': ('avm', 'knn', 'fisher'),
             'knn_branches': ENRICHED_KNN,
         })
