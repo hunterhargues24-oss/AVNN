@@ -1,0 +1,307 @@
+============================================================
+Iris  (150 samples, 4 features, 3 classes)
+============================================================
+  Accuracy    : 0.9600 ± 0.0389
+  Macro F1    : 0.9598 ± 0.0390
+  Weighted F1 : 0.9598 ± 0.0390
+
+Model summary (last fold):
+  Classes (3): 0: 33%  1: 33%  2: 33%
+  Train / val  : 102 / 18
+
+  Lambda  : 0.500
+  Tau     : cls0:0.604  cls1:0.604  cls2:0.610  (training-only)
+  Val F1  : 0.9442
+
+  Discriminant: QDA posterior (log π_k − 0.5·log|Σ_k| − 0.5·d²_M)
+  AVM score   : qda  prior_weight=1.0
+  Mahalanobis : full RDA (standardised)  (alpha=0.5  ridge=1e-06)
+  Logdet wt   : 1.0  (1=full QDA volume term, 0=distance+prior)
+  Prior temp  : 0.0  (0 = single built-in prior)
+  Ordinal EMD : False  (weight=0.5)
+  SupCon      : True  (weight=0.3  temp=0.1)
+  EMA         : False  (beta=0.9)
+  Dual bnd    : False
+  Boundary init: True
+  n_prototypes: 1  per_class_τ: True
+  ortho_reg   : 0.0
+  Heads       : ['avm', 'knn', 'fisher']  fusion=static
+
+  AVM branches (global view):
+    tanh_arccos : 0.3563
+    boundary    : 0.3563
+    circular    : 0.2874
+  KNN branches (frozen local view):
+    linear      : 0.3333
+    shape       : 0.3333
+    quadratic   : 0.3333
+  Fusion weights:
+    avm         : 0.3333
+    knn         : 0.3333
+    fisher      : 0.3333
+
+  Feature weights (top 5):
+    petal width (cm)             1.0049
+    petal length (cm)            1.0049
+    sepal width (cm)             0.9951
+    sepal length (cm)            0.9951
+  Feature weights (bottom 2):
+    sepal length (cm)            0.9951
+    sepal width (cm)             0.9951
+
+  Centroid drift:
+    class 0: 0.0098  
+    class 1: 0.0098  
+    class 2: 0.0095  
+
+  Lambda search: floor=0.5  chosen=0.500
+
+============================================================
+Wine  (178 samples, 13 features, 3 classes)
+============================================================
+  Accuracy    : 0.9944 ± 0.0111
+  Macro F1    : 0.9944 ± 0.0113
+  Weighted F1 : 0.9945 ± 0.0111
+
+Model summary (last fold):
+  Classes (3): 0: 33%  1: 39%  2: 28%
+  Train / val  : 123 / 20
+
+  Lambda  : 0.500
+  Tau     : cls0:0.655  cls1:0.572  cls2:0.562  (training-only)
+  Val F1  : 0.9489
+
+  Discriminant: QDA posterior (log π_k − 0.5·log|Σ_k| − 0.5·d²_M)
+  AVM score   : qda  prior_weight=1.0
+  Mahalanobis : full RDA (standardised)  (alpha=0.5  ridge=1e-06)
+  Logdet wt   : 1.0  (1=full QDA volume term, 0=distance+prior)
+  Prior temp  : 0.0  (0 = single built-in prior)
+  Ordinal EMD : False  (weight=0.5)
+  SupCon      : True  (weight=0.3  temp=0.1)
+  EMA         : False  (beta=0.9)
+  Dual bnd    : False
+  Boundary init: True
+  n_prototypes: 1  per_class_τ: True
+  ortho_reg   : 0.0
+  Heads       : ['avm', 'knn', 'fisher']  fusion=static
+
+  AVM branches (global view):
+    tanh_arccos : 0.3503
+    boundary    : 0.3564
+    circular    : 0.2933
+  KNN branches (frozen local view):
+    linear      : 0.3333
+    shape       : 0.3333
+    quadratic   : 0.3333
+  Fusion weights:
+    avm         : 0.3333
+    knn         : 0.3333
+    fisher      : 0.3333
+
+  Feature weights (top 5):
+    flavanoids                   1.1850
+    color_intensity              1.1686
+    proline                      1.0446
+    od280/od315_of_diluted_wines 1.0358
+    alcalinity_of_ash            1.0297
+  Feature weights (bottom 2):
+    nonflavanoid_phenols         0.9055
+    total_phenols                0.9155
+
+  Centroid drift:
+    class 0: 0.2786  ███████████
+    class 1: 0.4639  ██████████████████
+    class 2: 0.3874  ███████████████
+
+  Lambda search: floor=0.5  chosen=0.500
+
+============================================================
+Breast Cancer  (569 samples, 30 features, 2 classes)
+============================================================
+  Accuracy    : 0.9666 ± 0.0188
+  Macro F1    : 0.9634 ± 0.0208
+  Weighted F1 : 0.9662 ± 0.0191
+
+Model summary (last fold):
+  Classes (2): 0: 37%  1: 63%
+  Train / val  : 389 / 67
+
+  Lambda  : 0.500
+  Tau     : cls0:0.624  cls1:0.589  (training-only)
+  Val F1  : 0.8454
+
+  Discriminant: QDA posterior (log π_k − 0.5·log|Σ_k| − 0.5·d²_M)
+  AVM score   : inverse_distance  prior_weight=0.0
+  Mahalanobis : full RDA (standardised)  (alpha=0.5  ridge=1e-06)
+  Logdet wt   : 1.0  (1=full QDA volume term, 0=distance+prior)
+  Prior temp  : 0.0  (0 = single built-in prior)
+  Ordinal EMD : True  (weight=0.5)
+  SupCon      : True  (weight=0.3  temp=0.1)
+  EMA         : False  (beta=0.9)
+  Dual bnd    : False
+  Boundary init: True
+  n_prototypes: 1  per_class_τ: True
+  ortho_reg   : 0.0
+  Heads       : ['avm', 'knn', 'fisher']  fusion=static
+
+  AVM branches (global view):
+    tanh_arccos : 0.3591
+    boundary    : 0.3513
+    circular    : 0.2896
+  KNN branches (frozen local view):
+    linear      : 0.1667
+    shape       : 0.1667
+    quadratic   : 0.1667
+    log         : 0.1667
+    rank        : 0.1667
+    interaction : 0.1667
+  Fusion weights:
+    avm         : 0.3333
+    knn         : 0.3333
+    fisher      : 0.3333
+
+  Feature weights (top 5):
+    area error                   1.0306
+    worst area                   1.0294
+    worst concavity              1.0290
+    mean concavity               1.0286
+    mean area                    1.0285
+  Feature weights (bottom 2):
+    worst concave points         0.9738
+    mean symmetry                0.9740
+
+  Centroid drift:
+    class 0: 0.1620  ██████
+    class 1: 0.1614  ██████
+
+  Lambda search: floor=0.5  chosen=0.500
+
+============================================================
+Red Wine Quality  (1599 samples, 11 features, 3 classes)
+============================================================
+  Accuracy    : 0.8199 ± 0.0407
+  Macro F1    : 0.5953 ± 0.0438
+  Weighted F1 : 0.8264 ± 0.0286
+
+Model summary (last fold):
+  Classes (3): 0: 4%  1: 82%  2: 14%
+  Train / val  : 1090 / 190
+
+  Lambda  : 0.900
+  Tau     : cls0:0.553  cls1:0.656  cls2:0.663  (training-only)
+  Val F1  : 0.4737
+
+  Discriminant: QDA posterior (log π_k − 0.5·log|Σ_k| − 0.5·d²_M)
+  AVM score   : inverse_distance  prior_weight=0.0
+  Mahalanobis : full RDA (standardised)  (alpha=0.5  ridge=1e-06)
+  Logdet wt   : 1.0  (1=full QDA volume term, 0=distance+prior)
+  Prior temp  : 0.0  (0 = single built-in prior)
+  Ordinal EMD : True  (weight=0.5)
+  SupCon      : True  (weight=0.3  temp=0.1)
+  EMA         : True  (beta=0.9)
+  Dual bnd    : False
+  Boundary init: True
+  n_prototypes: 2  per_class_τ: True
+  ortho_reg   : 0.0
+  Heads       : ['avm', 'knn']  fusion=legacy
+
+  AVM branches (global view):
+    tanh_arccos : 0.3633
+    boundary    : 0.3422
+    circular    : 0.2945
+  KNN branches (frozen local view):
+    linear      : 0.1667
+    shape       : 0.1667
+    quadratic   : 0.1667
+    log         : 0.1667
+    rank        : 0.1667
+    interaction : 0.1667
+
+  Feature weights (top 5):
+    volatile acidity             1.0675
+    sulphates                    1.0673
+    alcohol                      1.0189
+    total sulfur dioxide         1.0086
+    chlorides                    1.0022
+  Feature weights (bottom 2):
+    free sulfur dioxide          0.9534
+    fixed acidity                0.9705
+
+  Centroid drift:
+    class 0: 0.2494  █████████
+    class 1: 0.5664  ██████████████████████
+    class 2: 0.8584  ██████████████████████████████████
+  Per-prototype drift:
+    class 0: p0=0.1089  p1=0.3898
+    class 1: p0=0.1056  p1=1.0273
+    class 2: p0=0.1404  p1=1.5764
+
+  Lambda search: floor=0.5  chosen=0.900
+
+============================================================
+White Wine Quality  (4898 samples, 11 features, 3 classes)
+============================================================
+  Accuracy    : 0.6978 ± 0.0171
+  Macro F1    : 0.6950 ± 0.0184
+  Weighted F1 : 0.6977 ± 0.0172
+
+Model summary (last fold):
+  Classes (3): 0: 33%  1: 45%  2: 22%
+  Train / val  : 3333 / 586
+
+  Lambda  : 0.500
+  Tau     : cls0:0.633  cls1:0.561  cls2:0.641  (training-only)
+  Val F1  : 0.3348
+
+  Discriminant: QDA posterior (log π_k − 0.5·log|Σ_k| − 0.5·d²_M)
+  AVM score   : inverse_distance  prior_weight=0.0
+  Mahalanobis : full RDA (standardised)  (alpha=0.5  ridge=1e-06)
+  Logdet wt   : 1.0  (1=full QDA volume term, 0=distance+prior)
+  Prior temp  : 0.0  (0 = single built-in prior)
+  Ordinal EMD : True  (weight=0.5)
+  SupCon      : True  (weight=0.3  temp=0.1)
+  EMA         : True  (beta=0.9)
+  Dual bnd    : False
+  Boundary init: True
+  n_prototypes: 3  per_class_τ: True
+  ortho_reg   : 0.0
+  Heads       : ['avm', 'knn', 'fisher']  fusion=static
+
+  AVM branches (global view):
+    tanh_arccos : 0.3562
+    boundary    : 0.3468
+    circular    : 0.2970
+  KNN branches (frozen local view):
+    linear      : 0.1667
+    shape       : 0.1667
+    quadratic   : 0.1667
+    log         : 0.1667
+    rank        : 0.1667
+    interaction : 0.1667
+  Fusion weights:
+    avm         : 0.3333
+    knn         : 0.3333
+    fisher      : 0.3333
+
+  Feature weights (top 5):
+    density                      1.0441
+    volatile acidity             1.0414
+    chlorides                    1.0330
+    alcohol                      1.0187
+    total sulfur dioxide         0.9925
+  Feature weights (bottom 2):
+    residual sugar               0.9614
+    free sulfur dioxide          0.9733
+
+  Centroid drift:
+    class 0: 0.2299  █████████
+    class 1: 0.3985  ███████████████
+    class 2: 0.3604  ██████████████
+  Per-prototype drift:
+    class 0: p0=0.2222  p1=0.2233  p2=0.2441
+    class 1: p0=0.2343  p1=0.5101  p2=0.4510
+    class 2: p0=0.2289  p1=0.3774  p2=0.4749
+
+  Lambda search: floor=0.5  chosen=0.500
+
+ArrivalType.csv not found – skipping large-dataset test.
